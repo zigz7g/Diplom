@@ -1,0 +1,20 @@
+[
+  {
+    "id": "demo1",
+    "rule_id": "DEREF_OF_NULL",
+    "severity": "error",
+    "message": "Pointer 'p' may be null when dereferenced.",
+    "file_path": "data/samples/demo.c",
+    "start_line": 12,
+    "end_line": 12
+  },
+  {
+    "id": "demo2",
+    "rule_id": "UNINIT_VAR",
+    "severity": "warning",
+    "message": "Variable 'x' is used uninitialized.",
+    "file_path": "data/samples/demo.c",
+    "start_line": 8,
+    "end_line": 8
+  }
+]

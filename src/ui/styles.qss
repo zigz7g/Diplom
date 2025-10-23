@@ -1,0 +1,179 @@
+/* === Глобальные настройки === */
+* {
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-size: 10pt;
+}
+
+QMainWindow {
+    background: #f9fafb;
+}
+
+/* === Шрифты для кода и сообщений === */
+QPlainTextEdit,
+QLineEdit,
+QListWidget {
+    font-family: "JetBrains Mono", "Consolas", "Courier New", monospace;
+    font-size: 10pt;
+}
+
+/* === Header === */
+#header {
+    background: #f3f5f7;
+    border-bottom: 1px solid #d6d8db;
+    padding: 8px;
+}
+
+#header QLabel {
+    font-weight: 600;
+    color: #4b5563;
+}
+
+#programName {
+    padding: 4px 8px;
+    border: 1px solid #cbd5e1;
+    border-radius: 4px;
+    background: white;
+}
+
+#programName:focus {
+    border-color: #3b82f6;
+    outline: none;
+}
+
+#snapshotInfo {
+    color: #64748b;
+}
+
+/* === Группы === */
+QGroupBox {
+    font-weight: 600;
+    margin-top: 12px;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding-top: 12px;
+    background: white;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+    color: #1e293b;
+}
+
+/* === Поля ввода === */
+QLineEdit {
+    padding: 5px 8px;
+    border: 1px solid #cbd5e1;
+    border-radius: 4px;
+    background: white;
+}
+
+QLineEdit:focus {
+    border-color: #3b82f6;
+}
+
+/* === Кнопки === */
+QPushButton {
+    padding: 5px 12px;
+    border: 1px solid #cbd5e1;
+    border-radius: 4px;
+    background: white;
+    color: #1e293b;
+}
+
+QPushButton:hover {
+    background: #f1f5f9;
+    border-color: #94a3b8;
+}
+
+QPushButton:pressed {
+    background: #e2e8f0;
+}
+
+/* === Чекбоксы === */
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #cbd5e1;
+    border-radius: 3px;
+    background: white;
+}
+
+QCheckBox::indicator:checked {
+    background: #3b82f6;
+    border-color: #3b82f6;
+}
+
+/* === Список находок === */
+#findingsList {
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+    background: white;
+    padding: 4px;
+}
+
+#findingsList::item {
+    padding: 6px 8px;
+    border-bottom: 1px solid #f1f5f9;
+}
+
+#findingsList::item:selected {
+    background: #dbeafe;
+    color: #1e40af;
+}
+
+#findingsList::item:hover {
+    background: #f0f9ff;
+}
+
+/* === Текстовые поля кода и сообщений === */
+QPlainTextEdit {
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+    background: #fafafa;
+    padding: 6px;
+}
+
+QPlainTextEdit:focus {
+    border-color: #cbd5e1;
+}
+
+/* === Статус-бар === */
+QStatusBar {
+    background: #f7f7f7;
+    border-top: 1px solid #e1e1e1;
+    color: #4b5563;
+    padding: 4px 8px;
+}
+
+/* === Тулбар === */
+QToolBar {
+    background: white;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 4px;
+    spacing: 6px;
+}
+
+QToolBar QToolButton {
+    padding: 4px 8px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: #334155;
+}
+
+QToolBar QToolButton:hover {
+    background: #f1f5f9;
+    border-color: #cbd5e1;
+}
+
+/* === Сплиттер === */
+QSplitter::handle {
+    background: #e2e8f0;
+    width: 8px;
+}
+
+QSplitter::handle:hover {
+    background: #cbd5e1;
+}

@@ -1,3 +1,4 @@
+# services/export_service.py
 from __future__ import annotations
 from typing import Iterable
 from pathlib import Path
@@ -12,6 +13,7 @@ def export_warnings(items: Iterable[WarningDTO], out_path: str) -> str:
         "start_line": w.start_line,
         "end_line": w.end_line,
         "message": w.message,
+        "code_snippet": w.code_snippet,  # Включаем фрагмент кода в экспорт
     } for w in items]
 
     df = pd.DataFrame(rows)

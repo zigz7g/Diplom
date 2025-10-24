@@ -1,4 +1,4 @@
-# src/ui/main_window.py
+# ui/main_window.py
 from pathlib import Path
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QGroupBox,
@@ -224,11 +224,13 @@ class MainWindow(QMainWindow):
     def _build_menus(self):
         m_file = self.menuBar().addMenu("Файл")
         act_new = QAction("Новый проект…", self); act_new.triggered.connect(self._todo)
-        act_open_sarif = QAction("Открыть SARIF отчёт…", self); act_open_sarif.triggered.connect(self._open_sarif)  # Новый пункт
+        act_open_pdf = QAction("Открыть PDF отчёт…", self); act_open_pdf.triggered.connect(self._open_pdf)  # Новый пункт
+        act_open_sarif = QAction("Открыть SARIF отчёт…", self); act_open_sarif.triggered.connect(self._open_sarif)
         act_export_csv = QAction("Экспорт CSV/XLSX…", self); act_export_csv.triggered.connect(self._export)
         act_exit = QAction("Выход", self); act_exit.triggered.connect(self.close)
         m_file.addAction(act_new)
-        m_file.addAction(act_open_sarif); m_file.addSeparator()  # Добавляем пункт
+        m_file.addAction(act_open_pdf)  # Добавляем пункт
+        m_file.addAction(act_open_sarif); m_file.addSeparator()
         m_file.addAction(act_export_csv); m_file.addSeparator()
         m_file.addAction(act_exit)
 
@@ -255,14 +257,17 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb)
         b_new = QAction("Новый проект", self);
         b_new.triggered.connect(self._todo)
-        b_open = QAction("Открыть SARIF", self);
-        b_open.triggered.connect(self._open_sarif)  # Новый пункт
+        b_open_pdf = QAction("Открыть PDF", self);
+        b_open_pdf.triggered.connect(self._open_pdf)  # Новый пункт
+        b_open_sarif = QAction("Открыть SARIF", self);
+        b_open_sarif.triggered.connect(self._open_sarif)
         b_export = QAction("Экспорт", self);
         b_export.triggered.connect(self._export)
         b_ai = QAction("Аннотация AI", self);
         b_ai.setEnabled(False)
         tb.addAction(b_new);
-        tb.addAction(b_open);
+        tb.addAction(b_open_pdf);
+        tb.addAction(b_open_sarif);
         tb.addSeparator()
         tb.addAction(b_export);
         tb.addSeparator();
@@ -286,6 +291,22 @@ class MainWindow(QMainWindow):
             "GUI вдохновлён Solar appScreener. Ввод: PDF-отчёт (позже), экспорт: CSV/XLSX (позже).\n"
             "Версия MVP: 0.1"
         )
+
+    def _open_pdf(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть PDF отчёт", "", "PDF (*.pdf)")
+        if not path:
+            return
+        try:
+            importer = PdfReportImporter()  # Создаем импортёр PDF
+            items = importer.load(path)  # Загружаем уязвимости из PDF файла
+            self.repo.clear()
+            self.repo.add_many(items)
+            self._warnings = self.repo.list_all()  # Получаем все уязвимости
+            self._populate_list()  # Обновляем список уязвимостей
+            self.snapshot_info.setText(f"Снапшот: {Path(path).name}")  # Обновляем информацию о файле
+            QMessageBox.information(self, "Импорт PDF", f"Загружено записей: {len(items)}")  # Показываем уведомление
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка импорта PDF", str(e))
 
     def _open_sarif(self):
         path, _ = QFileDialog.getOpenFileName(self, "Открыть SARIF отчёт", "", "SARIF (*.sarif);;JSON (*.json)")
@@ -373,37 +394,8 @@ class MainWindow(QMainWindow):
         self.lbl_line.setText(str(vuln.start_line))
         self.msg_view.setPlainText(vuln.message)  # Сообщение анализатора
 
-        # Получаем только строки кода
-        code_snippet = self._get_code_snippet(vuln.raw)  # Извлекаем строки кода
-
-        if code_snippet:
-            self.code_view.setPlainText(code_snippet)  # Отображаем только фрагмент кода
-        else:
-            self.code_view.setPlainText(f"Фрагмент кода не найден для: {vuln.file_path}:{vuln.start_line}")
-
-    def _get_code_snippet(self, raw_data: str) -> str:
-        """Извлекаем фрагмент кода из SARIF данных (snippet или location)."""
-        try:
-            # Пробуем разобрать JSON-строку
-            data = json.loads(raw_data)
-
-            # Если есть фрагмент кода в 'snippet', извлекаем его
-            snippet = data.get("message", {}).get("text", "")
-            if snippet:
-                return snippet.strip()
-
-            # Если snippet нет, пытаемся извлечь код из 'locations' (если есть)
-            locations = data.get("locations", [])
-            if locations:
-                # Получаем путь и строку для извлечения контекста кода
-                file_path = locations[0].get("physicalLocation", {}).get("fileLocation", {}).get("uri", "")
-                line = locations[0].get("physicalLocation", {}).get("region", {}).get("startLine", 0)
-                if file_path and line:
-                    # Извлекаем несколько строк вокруг уязвимости
-                    return self.code.get_context(file_path, line, 5)  # Возвращаем 5 строк (до и после)
-            return None
-        except Exception as e:
-            return f"Ошибка при извлечении фрагмента: {str(e)}"
+        # Отображаем фрагмент кода из PDF
+        self.code_view.setPlainText(vuln.code_snippet)
 
     def _update_count_label(self):
         shown = self.findings.count()

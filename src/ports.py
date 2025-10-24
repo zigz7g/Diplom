@@ -1,3 +1,4 @@
+# ports.py
 from typing import Protocol, Iterable, List
 from core.schema import WarningDTO
 

@@ -9,3 +9,4 @@ class WarningDTO(BaseModel):
     start_line: int
     end_line: int
     raw: str = ""
+    code_snippet: str = ""  # Новое поле для фрагмента кода из PDF

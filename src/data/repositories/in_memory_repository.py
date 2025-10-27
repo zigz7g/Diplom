@@ -1,17 +1,12 @@
-# data/repositories/in_memory_repository.py
-from typing import List, Iterable
+from typing import List
 from core.schema import WarningDTO
-from ports import Repository
 
-class InMemoryRepository(Repository):
+class InMemoryRepository:
     def __init__(self) -> None:
         self._items: List[WarningDTO] = []
 
-    def clear(self) -> None:
-        self._items.clear()
-
-    def add_many(self, items: Iterable[WarningDTO]) -> None:
-        self._items.extend(items)
+    def replace_all(self, items: List[WarningDTO]) -> None:
+        self._items = list(items)
 
     def list_all(self) -> List[WarningDTO]:
         return list(self._items)

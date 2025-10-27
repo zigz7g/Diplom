@@ -1,29 +1,37 @@
-# services/export_service.py
 from __future__ import annotations
+
+import csv
 from typing import Iterable
-from pathlib import Path
-import pandas as pd
 from core.schema import WarningDTO
 
-def export_warnings(items: Iterable[WarningDTO], out_path: str) -> str:
-    rows = [{
-        "rule_id": w.rule_id,
-        "severity": w.severity,
-        "file_path": w.file_path,
-        "start_line": w.start_line,
-        "end_line": w.end_line,
-        "message": w.message,
-        "code_snippet": w.code_snippet,  # Включаем фрагмент кода в экспорт
-    } for w in items]
-
-    df = pd.DataFrame(rows)
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if out.suffix.lower() == ".xlsx":
-        df.to_excel(out, index=False)
-    else:
-        # по умолчанию CSV
-        if out.suffix.lower() != ".csv":
-            out = out.with_suffix(".csv")
-        df.to_csv(out, index=False, encoding="utf-8-sig")
-    return str(out)
+class ExportService:
+    """
+    Экспорт результатов в CSV.
+    По умолчанию UTF-8 с BOM (utf-8-sig) и разделитель ';' — удобно для Excel в RU-среде.
+    Можно менять через параметры.
+    """
+    def to_csv(
+        self,
+        items: Iterable[WarningDTO],
+        out_path: str,
+        *,
+        encoding: str = "utf-8-sig",
+        delimiter: str = ";",
+    ) -> int:
+        cols = ["index", "severity", "rule", "file", "line", "message", "snippet"]
+        count = 0
+        with open(out_path, "w", encoding=encoding, newline="") as f:
+            wr = csv.writer(f, delimiter=delimiter)
+            wr.writerow(cols)
+            for i, w in enumerate(items, 1):
+                wr.writerow([
+                    i,
+                    (w.severity or ""),
+                    (w.rule or ""),
+                    (w.file_path or ""),
+                    (w.start_line if w.start_line is not None else ""),
+                    (w.message or "").replace("\n", " ").replace("\r", " "),
+                    (w.code_snippet or "").replace("\n", " ").replace("\r", " "),
+                ])
+                count += 1
+        return count

@@ -1,14 +1,12 @@
-# app.py
-from PySide6.QtWidgets import QApplication
 import sys, os
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+from PySide6.QtWidgets import QApplication
 from ui.main_window import MainWindow
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Cyber AI")
+    app.setApplicationName("SVACE Annotator (Core)")
     win = MainWindow()
-    win.resize(1100, 720)
+    win.resize(1200, 720)
     win.show()
     sys.exit(app.exec())
 

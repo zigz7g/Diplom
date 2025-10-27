@@ -1,12 +1,14 @@
-from pydantic import BaseModel
+from dataclasses import dataclass
+from typing import Optional, Literal
 
-class WarningDTO(BaseModel):
-    id: str
-    rule_id: str
-    severity: str
-    message: str
-    file_path: str
-    start_line: int
-    end_line: int
-    raw: str = ""
-    code_snippet: str = ""  # Новое поле для фрагмента кода из PDF
+Severity = Literal["error", "warning", "note"]
+
+@dataclass
+class WarningDTO:
+    id: str                # ruleId
+    title: str             # читаемое имя правила (если есть)
+    message: str           # сообщение анализатора
+    severity: Severity     # error|warning|note
+    file_path: str         # относительный или абсолютный путь (как в отчёте)
+    start_line: Optional[int]  # 1-based
+    end_line: Optional[int]    # 1-based

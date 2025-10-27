@@ -1,418 +1,249 @@
-# ui/main_window.py
+from __future__ import annotations
+
 from pathlib import Path
-from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QGroupBox,
-    QListWidget, QListWidgetItem, QPlainTextEdit, QFileDialog, QMessageBox,
-    QLineEdit, QLabel, QPushButton, QCheckBox, QGridLayout, QFrame,
-    QStatusBar, QToolBar
-)
+from typing import List
+
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QColor
-import json
-# Бизнес-слой
+from PySide6.QtGui import QAction, QFont
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
+    QListWidget, QListWidgetItem, QPlainTextEdit, QFileDialog, QMessageBox,
+    QLineEdit, QLabel, QPushButton, QCheckBox, QStatusBar, QToolBar
+)
+
+from core.schema import WarningDTO
 from data.repositories.in_memory_repository import InMemoryRepository
-from data.importers.sample_json_importer import SampleJsonImporter
-from services.use_cases import ImportWarningsService
-from data.importers.pdf_report_importer import PdfReportImporter
-from services.export_service import export_warnings
-from services.code_provider import SimpleCodeProvider
-from data.importers.sarif_report_importer import SarifReportImporter
+from services.use_cases import ImportSarifService, ImportCsvService, CodeProvider
 
-
-# Цвета серьёзности (только для подсветки текста в списке)
-SEV_COLOR = {
-    "error": QColor(220, 20, 60),      # crimson
-    "warning": QColor(255, 140, 0),    # dark orange
-    "note": QColor(70, 130, 180),      # steel blue
-}
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SVACE Annotator")
-        self.resize(1200, 800)
+        self.resize(1280, 800)
 
-        # === Состояние ===
-        self.current_program_name = ""
+        # состояния / сервисы
         self.repo = InMemoryRepository()
-        self.importer = SampleJsonImporter()
-        self.code = SimpleCodeProvider()
-        self.import_uc = ImportWarningsService(self.importer, self.repo)
-        self._warnings = []
+        self.import_sarif = ImportSarifService(self.repo)
+        self.import_csv = ImportCsvService(self.repo)
+        self.code = CodeProvider()
+        self._warnings: List[WarningDTO] = []
 
-        # === Верхняя панель ===
-        header = QFrame()
-        header.setObjectName("header")
-        h = QHBoxLayout(header)
-        h.setContentsMargins(12, 6, 12, 6)
+        # UI
+        self._build_ui()
+        self._build_actions()
 
-        lbl_proj = QLabel("Проект:")
-        lbl_proj.setObjectName("projectLabel")
-        self.program_name = QLineEdit()
-        self.program_name.setObjectName("programName")
-        self.program_name.setPlaceholderText("Название программы (как в Solar appScreener: Project / Application)")
-        self.program_name.textChanged.connect(self._on_program_name)
-
-        self.snapshot_info = QLabel("Снапшот: не загружен")
-        self.snapshot_info.setObjectName("snapshotInfo")
-        self.snapshot_info.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-
-        h.addWidget(lbl_proj)
-        h.addWidget(self.program_name, 2)
-        h.addWidget(self.snapshot_info, 1)
-
-        # === Левая панель: фильтры + список ===
-        left = QWidget()
-        left.setObjectName("leftPanel")
-        left_l = QVBoxLayout(left)
-        left_l.setContentsMargins(6, 6, 6, 6)
-
-        filters = QGroupBox("Фильтры")
-        filters.setObjectName("filtersGroup")
-        g = QGridLayout(filters)
-        g.setSpacing(6)
-
-        self.filter_search = QLineEdit()
-        self.filter_search.setObjectName("filterSearch")
-        self.filter_search.setPlaceholderText("Поиск по правилу / файлу / тексту…")
-
-        self.cb_error = QCheckBox("Error")
-        self.cb_error.setObjectName("cbError")
-        self.cb_error.setChecked(True)
-
-        self.cb_warning = QCheckBox("Warning")
-        self.cb_warning.setObjectName("cbWarning")
-        self.cb_warning.setChecked(True)
-
-        self.cb_note = QCheckBox("Note")
-        self.cb_note.setObjectName("cbNote")
-        self.cb_note.setChecked(True)
-
-        btn_clear = QPushButton("Сбросить")
-        btn_clear.setObjectName("btnClearFilters")
-
-        g.addWidget(self.filter_search, 0, 0, 1, 3)
-        g.addWidget(self.cb_error, 1, 0)
-        g.addWidget(self.cb_warning, 1, 1)
-        g.addWidget(self.cb_note, 1, 2)
-        g.addWidget(btn_clear, 2, 2, alignment=Qt.AlignRight)
-
-        self.findings = QListWidget()
-        self.findings.setObjectName("findingsList")
-        self.findings.currentItemChanged.connect(self._on_item_changed)
-
-        left_l.addWidget(filters)
-        left_l.addWidget(self.findings, 1)
-
-        self.filter_search.textChanged.connect(self._apply_filter)
-        self.cb_error.toggled.connect(self._apply_filter)
-        self.cb_warning.toggled.connect(self._apply_filter)
-        self.cb_note.toggled.connect(self._apply_filter)
-        btn_clear.clicked.connect(self._clear_filters)
-
-        # === Центр: код ===
-        center = QWidget()
-        center.setObjectName("centerPanel")
-        center_l = QVBoxLayout(center)
-        center_l.setContentsMargins(6, 6, 6, 6)
-
-        self.code_view = QPlainTextEdit()
-        self.code_view.setObjectName("codeView")
-        self.code_view.setReadOnly(True)
-        center_l.addWidget(self.code_view, 1)
-
-        # === Правая панель: детали + AI ===
-        right = QWidget()
-        right.setObjectName("rightPanel")
-        right_l = QVBoxLayout(right)
-        right_l.setContentsMargins(6, 6, 6, 6)
-
-        box_details = QGroupBox("Детали")
-        box_details.setObjectName("detailsGroup")
-        det = QGridLayout(box_details)
-        det.setSpacing(6)
-
-        self.lbl_rule = QLabel("-")
-        self.lbl_sev = QLabel("-")
-        self.lbl_file = QLabel("-")
-        self.lbl_line = QLabel("-")
-
-        det.addWidget(QLabel("Правило:"), 0, 0)
-        det.addWidget(self.lbl_rule, 0, 1)
-        det.addWidget(QLabel("Уровень:"), 1, 0)
-        det.addWidget(self.lbl_sev, 1, 1)
-        det.addWidget(QLabel("Файл:"), 2, 0)
-        det.addWidget(self.lbl_file, 2, 1)
-        det.addWidget(QLabel("Строка:"), 3, 0)
-        det.addWidget(self.lbl_line, 3, 1)
-
-        box_msg = QGroupBox("Сообщение анализатора")
-        box_msg.setObjectName("messageGroup")
-        ml = QVBoxLayout(box_msg)
-        self.msg_view = QPlainTextEdit()
-        self.msg_view.setObjectName("messageView")
-        self.msg_view.setReadOnly(True)
-        self.msg_view.setMaximumHeight(140)
-        ml.addWidget(self.msg_view)
-
-        box_ai = QGroupBox("AI-разметка (скоро)")
-        box_ai.setObjectName("aiGroup")
-        ail = QVBoxLayout(box_ai)
-        self.ai_placeholder = QLabel(
-            "Заглушка: подключим локальную LLM позже. "
-            "Здесь появятся: краткое описание, root cause, fix-suggestion, риск."
-        )
-        self.ai_placeholder.setObjectName("aiPlaceholder")
-        self.ai_placeholder.setWordWrap(True)
-        ail.addWidget(self.ai_placeholder)
-
-        right_l.addWidget(box_details)
-        right_l.addWidget(box_msg)
-        right_l.addWidget(box_ai, 1)
-
-        # === Сплиттер и центральный виджет ===
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setObjectName("mainSplitter")
-        splitter.addWidget(left)
-        splitter.addWidget(center)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 5)
-        splitter.setStretchFactor(2, 3)
-
-        central = QWidget()
-        central.setObjectName("centralWidget")
-        root_l = QVBoxLayout(central)
-        root_l.setContentsMargins(0, 0, 0, 0)
-        root_l.setSpacing(0)
-        root_l.addWidget(header)
-        root_l.addWidget(splitter, 1)
+    # ================= UI =================
+    def _build_ui(self) -> None:
+        central = QWidget(self)
         self.setCentralWidget(central)
+        root = QVBoxLayout(central)
 
-        # === Меню и тулбар ===
-        self._build_menus()
-        self._build_toolbar()
+        # Заголовок
+        hdr = QHBoxLayout()
+        root.addLayout(hdr)
+        hdr.addWidget(QLabel("Проект:"))
+        self.ed_project = QLineEdit()
+        self.ed_project.setPlaceholderText("Название программы / проекта")
+        hdr.addWidget(self.ed_project, 1)
+        self.lbl_snapshot = QLabel("Снимок: -")
+        hdr.addWidget(self.lbl_snapshot)
 
-        # === Статус-бар ===
-        sb = QStatusBar()
-        sb.setObjectName("statusBar")
-        self.lbl_count = QLabel("0 найдено")
-        self.lbl_count.setObjectName("statusLabel")
-        sb.addPermanentWidget(self.lbl_count)
-        self.setStatusBar(sb)
+        # Сплиттер
+        splitter = QSplitter(Qt.Horizontal)
+        root.addWidget(splitter, 1)
 
-        # === Загрузка стиля ===
-        self._load_stylesheet()
+        # Левая колонка — фильтры + список
+        left = QWidget(); left_l = QVBoxLayout(left); left_l.setContentsMargins(0, 0, 0, 0)
+        self.ed_search = QLineEdit(placeholderText="Поиск по правилу / файлу / тексту…")
+        left_l.addWidget(self.ed_search)
+        row_f = QHBoxLayout()
+        self.cb_err = QCheckBox("Error"); self.cb_err.setChecked(True)
+        self.cb_warn = QCheckBox("Warning"); self.cb_warn.setChecked(True)
+        self.cb_note = QCheckBox("Note"); self.cb_note.setChecked(True)
+        btn_reset = QPushButton("Сбросить"); btn_reset.clicked.connect(self._reset_filters)
+        row_f.addWidget(self.cb_err); row_f.addWidget(self.cb_warn); row_f.addWidget(self.cb_note)
+        row_f.addStretch(1); row_f.addWidget(btn_reset)
+        left_l.addLayout(row_f)
 
-    def _load_stylesheet(self):
-        """Загружает QSS из файла."""
-        paths_to_try = [
-            Path(__file__).parent / "styles.qss",
-            Path("src/ui/styles.qss"),
-            Path("styles.qss")
-        ]
-        for path in paths_to_try:
-            if path.exists():
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        self.setStyleSheet(f.read())
-                    return
-                except Exception as e:
-                    print(f"Не удалось загрузить стиль из {path}: {e}")
-        print("Файл стиля styles.qss не найден. Используется системный стиль.")
+        self.list = QListWidget()
+        left_l.addWidget(self.list, 1)
+        splitter.addWidget(left)
 
-    def _build_menus(self):
+        # Центр — ТОЛЬКО код
+        self.code_view = QPlainTextEdit(); self.code_view.setReadOnly(True)
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.Monospace); mono.setPointSize(10)
+        self.code_view.setFont(mono)
+        splitter.addWidget(self.code_view)
+
+        # Правая колонка — детали
+        right = QWidget(); right_l = QVBoxLayout(right); right_l.setContentsMargins(6, 6, 6, 6)
+
+        def kv(key: str, tgt: QLabel) -> QWidget:
+            w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0, 0, 0, 0)
+            lab = QLabel(key); lab.setMinimumWidth(80)
+            l.addWidget(lab); l.addWidget(tgt, 1, Qt.AlignRight); return w
+
+        self.val_rule = QLabel("-")
+        self.val_sev = QLabel("-")
+        self.val_file = QLabel("-")
+        self.val_line = QLabel("-")
+        right_l.addWidget(kv("Правило:", self.val_rule))
+        right_l.addWidget(kv("Уровень:", self.val_sev))
+        right_l.addWidget(kv("Файл:", self.val_file))
+        right_l.addWidget(kv("Строка:", self.val_line))
+
+        right_l.addWidget(QLabel("Сообщение анализатора"))
+        self.msg_view = QPlainTextEdit(); self.msg_view.setReadOnly(True)
+        right_l.addWidget(self.msg_view, 1)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+
+        # Статус-бар
+        sb = QStatusBar(); self.setStatusBar(sb)
+        self.lbl_src_root = QLabel("Исходники: не привязаны")
+        sb.addPermanentWidget(self.lbl_src_root)
+
+        # Сигналы
+        self.list.currentItemChanged.connect(self._on_item_changed)
+        self.ed_search.textChanged.connect(self._populate_list)
+        self.cb_err.stateChanged.connect(self._populate_list)
+        self.cb_warn.stateChanged.connect(self._populate_list)
+        self.cb_note.stateChanged.connect(self._populate_list)
+
+    def _build_actions(self) -> None:
+        tb = QToolBar("Main"); self.addToolBar(tb)
+
+        act_open_sarif = QAction("Открыть SARIF", self)
+        act_open_csv = QAction("Открыть CSV/TSV", self)
+        act_bind_src = QAction("Привязать исходники…", self)
+        act_new = QAction("Новый проект", self)
+
+        act_open_sarif.triggered.connect(self._open_sarif)
+        act_open_csv.triggered.connect(self._open_csv)
+        act_bind_src.triggered.connect(self._pick_sources_root)
+        act_new.triggered.connect(self._new_project)
+
+        for a in (act_open_sarif, act_open_csv, act_bind_src, act_new):
+            tb.addAction(a)
+
         m_file = self.menuBar().addMenu("Файл")
-        act_new = QAction("Новый проект…", self); act_new.triggered.connect(self._todo)
-        act_open_pdf = QAction("Открыть PDF отчёт…", self); act_open_pdf.triggered.connect(self._open_pdf)  # Новый пункт
-        act_open_sarif = QAction("Открыть SARIF отчёт…", self); act_open_sarif.triggered.connect(self._open_sarif)
-        act_export_csv = QAction("Экспорт CSV/XLSX…", self); act_export_csv.triggered.connect(self._export)
-        act_exit = QAction("Выход", self); act_exit.triggered.connect(self.close)
+        m_file.addAction(act_open_sarif)
+        m_file.addAction(act_open_csv)
+        m_file.addSeparator()
+        m_file.addAction(act_bind_src)
+        m_file.addSeparator()
         m_file.addAction(act_new)
-        m_file.addAction(act_open_pdf)  # Добавляем пункт
-        m_file.addAction(act_open_sarif); m_file.addSeparator()
-        m_file.addAction(act_export_csv); m_file.addSeparator()
-        m_file.addAction(act_exit)
 
-        m_an = self.menuBar().addMenu("Анализ")
-        m_an.addAction(QAction("Запустить аннотацию AI (локально)", self, enabled=False))
-        m_an.addAction(QAction("Пересчитать риск", self, enabled=False))
-        m_an.addAction(QAction("Пометить как ложноположительное", self, enabled=False))
+    # ============== Команды ==============
+    def _new_project(self) -> None:
+        self.repo.replace_all([])
+        self._warnings.clear()
+        self.list.clear(); self.code_view.clear(); self.msg_view.clear()
+        self.val_rule.setText("-"); self.val_sev.setText("-"); self.val_file.setText("-"); self.val_line.setText("-")
+        self.lbl_snapshot.setText("Снимок: -")
 
-        m_view = self.menuBar().addMenu("Вид")
-        m_view.addAction(QAction("Тёмная тема", self, enabled=False))
-        m_view.addAction(QAction("Светлая тема", self, enabled=False))
-
-        m_help = self.menuBar().addMenu("Справка")
-        m_help.addAction(QAction("Горячие клавиши", self, enabled=False))
-        act_about = QAction("О программе", self); act_about.triggered.connect(self._about)
-        m_help.addAction(act_about)
-
-        m_dev = self.menuBar().addMenu("Dev")
-        act_dev_import = QAction("Импорт sample JSON…", self); act_dev_import.triggered.connect(self._import_sample_json)
-        m_dev.addAction(act_dev_import)
-
-    def _build_toolbar(self):
-        tb = QToolBar("Основные действия")
-        self.addToolBar(tb)
-        b_new = QAction("Новый проект", self);
-        b_new.triggered.connect(self._todo)
-        b_open_pdf = QAction("Открыть PDF", self);
-        b_open_pdf.triggered.connect(self._open_pdf)  # Новый пункт
-        b_open_sarif = QAction("Открыть SARIF", self);
-        b_open_sarif.triggered.connect(self._open_sarif)
-        b_export = QAction("Экспорт", self);
-        b_export.triggered.connect(self._export)
-        b_ai = QAction("Аннотация AI", self);
-        b_ai.setEnabled(False)
-        tb.addAction(b_new);
-        tb.addAction(b_open_pdf);
-        tb.addAction(b_open_sarif);
-        tb.addSeparator()
-        tb.addAction(b_export);
-        tb.addSeparator();
-        tb.addAction(b_ai)
-
-    def _on_program_name(self, text: str):
-        self.current_program_name = text.strip()
-        title = "SVACE Annotator"
-        if self.current_program_name:
-            title += f" — {self.current_program_name}"
-        self.setWindowTitle(title)
-
-    def _todo(self):
-        QMessageBox.information(self, "Недоступно", "Функция будет реализована позже.")
-
-    def _about(self):
-        QMessageBox.about(
-            self,
-            "О программе",
-            "SVACE Annotator — офлайн-приложение для разметки результатов статического анализа.\n"
-            "GUI вдохновлён Solar appScreener. Ввод: PDF-отчёт (позже), экспорт: CSV/XLSX (позже).\n"
-            "Версия MVP: 0.1"
-        )
-
-    def _open_pdf(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Открыть PDF отчёт", "", "PDF (*.pdf)")
+    def _open_sarif(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите SARIF JSON", "", "JSON/SARIF (*.json *.sarif)")
         if not path:
             return
         try:
-            importer = PdfReportImporter()  # Создаем импортёр PDF
-            items = importer.load(path)  # Загружаем уязвимости из PDF файла
-            self.repo.clear()
-            self.repo.add_many(items)
-            self._warnings = self.repo.list_all()  # Получаем все уязвимости
-            self._populate_list()  # Обновляем список уязвимостей
-            self.snapshot_info.setText(f"Снапшот: {Path(path).name}")  # Обновляем информацию о файле
-            QMessageBox.information(self, "Импорт PDF", f"Загружено записей: {len(items)}")  # Показываем уведомление
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка импорта PDF", str(e))
-
-    def _open_sarif(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Открыть SARIF отчёт", "", "SARIF (*.sarif);;JSON (*.json)")
-        if not path:
-            return
-        try:
-            importer = SarifReportImporter()  # Создаем импортёр SARIF
-            items = importer.load(path)  # Загружаем уязвимости из SARIF файла
-            self.repo.clear()
-            self.repo.add_many(items)
-            self._warnings = self.repo.list_all()  # Получаем все уязвимости
-            self._populate_list()  # Обновляем список уязвимостей
-            self.snapshot_info.setText(f"Снапшот: {Path(path).name}")  # Обновляем информацию о файле
-            QMessageBox.information(self, "Импорт SARIF", f"Загружено записей: {len(items)}")  # Показываем уведомление
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка импорта SARIF", str(e))
-
-    def _import_sample_json(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите пример JSON", "", "JSON (*.json)")
-        if not path:
-            return
-        try:
-            n = self.import_uc.run(path)
+            n = self.import_sarif.run(path)
             self._warnings = self.repo.list_all()
+            self.lbl_snapshot.setText(f"Снимок: {Path(path).name}")
             self._populate_list()
-            self.snapshot_info.setText(f"Снапшот: {Path(path).name} (sample)")
-            self.filter_search.setFocus()
-            QMessageBox.information(self, "Импорт", f"Загружено записей: {n}")
+            QMessageBox.information(self, "Импорт SARIF", f"Загружено записей: {n}")
+            if self.lbl_src_root.text().endswith("не привязаны"):
+                self._pick_sources_root(quiet=True)
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка импорта JSON", str(e))
+            QMessageBox.critical(self, "Ошибка импорта", str(e))
 
-    def _populate_list(self):
-        self.findings.clear()
-        for w in self._warnings:
-            item = QListWidgetItem(self._format_item(w))
-            item.setData(Qt.UserRole, w)
-            col = SEV_COLOR.get((w.severity or "").lower())
-            if col:
-                item.setForeground(col)
-            self.findings.addItem(item)
-        self._update_count_label()
-
-    def _format_item(self, w):
-        return f"[{w.severity}] {w.rule_id} — {w.file_path}:{w.start_line}"
-
-    def _apply_filter(self):
-        q = self.filter_search.text().strip().lower()
-        show_error = self.cb_error.isChecked()
-        show_warning = self.cb_warning.isChecked()
-        show_note = self.cb_note.isChecked()
-
-        self.findings.clear()
-        for w in self._warnings:
-            sev = (w.severity or "").lower()
-            if sev == "error" and not show_error: continue
-            if sev == "warning" and not show_warning: continue
-            if sev == "note" and not show_note: continue
-
-            s = f"{w.rule_id} {w.severity} {w.message} {w.file_path}".lower()
-            if q and q not in s:
-                continue
-            item = QListWidgetItem(self._format_item(w))
-            item.setData(Qt.UserRole, w)
-            col = SEV_COLOR.get(sev)
-            if col:
-                item.setForeground(col)
-            self.findings.addItem(item)
-        self._update_count_label()
-
-    def _clear_filters(self):
-        self.filter_search.clear()
-        self.cb_error.setChecked(True)
-        self.cb_warning.setChecked(True)
-        self.cb_note.setChecked(True)
-        self._apply_filter()
-
-    def _on_item_changed(self, current_item, _):
-        if not current_item:
-            return
-
-        vuln = current_item.data(Qt.UserRole)
-        self.lbl_rule.setText(vuln.rule_id)
-        self.lbl_sev.setText(vuln.severity)
-        self.lbl_file.setText(vuln.file_path)
-        self.lbl_line.setText(str(vuln.start_line))
-        self.msg_view.setPlainText(vuln.message)  # Сообщение анализатора
-
-        # Отображаем фрагмент кода из PDF
-        self.code_view.setPlainText(vuln.code_snippet)
-
-    def _update_count_label(self):
-        shown = self.findings.count()
-        total = len(self._warnings)
-        self.lbl_count.setText(f"Отобрано: {shown} / всего: {total}")
-
-    def _export(self):
-        if not self._warnings:
-            QMessageBox.information(self, "Экспорт", "Нет данных для экспорта.")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить отчёт", "", "Excel (*.xlsx);;CSV (*.csv)"
-        )
+    def _open_csv(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите CSV/TSV", "", "CSV/TSV/TXT (*.csv *.tsv *.txt)")
         if not path:
             return
         try:
-            out = export_warnings(self._warnings, path)
-            QMessageBox.information(self, "Экспорт", f"Сохранено: {out}")
+            n = self.import_csv.run(path)
+            self._warnings = self.repo.list_all()
+            self.lbl_snapshot.setText(f"Снимок: {Path(path).name}")
+            self._populate_list()
+            QMessageBox.information(self, "Импорт CSV/TSV", f"Загружено записей: {n}")
+            if self.lbl_src_root.text().endswith("не привязаны"):
+                self._pick_sources_root(quiet=True)
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка экспорта", str(e))
+            QMessageBox.critical(self, "Ошибка импорта", str(e))
+
+    def _pick_sources_root(self, quiet: bool = False) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Укажите корневую папку исходников")
+        if not d:
+            if not quiet:
+                QMessageBox.information(self, "Исходники",
+                                        "Можно привязать исходники позже: Файл → Привязать исходники…")
+            return
+        self.code.set_root(d)
+        self.lbl_src_root.setText(f"Исходники: {d}")
+        self._show_current()
+
+    # ============== Список / отображение ==============
+    def _reset_filters(self) -> None:
+        self.ed_search.clear()
+        self.cb_err.setChecked(True)
+        self.cb_warn.setChecked(True)
+        self.cb_note.setChecked(True)
+        self._populate_list()
+
+    def _populate_list(self) -> None:
+        """Перестроить список уязвимостей с учётом фильтров и поиска."""
+        query = (self.ed_search.text() or "").lower().strip()
+        allowed = set()
+        if self.cb_err.isChecked(): allowed.add("error")
+        if self.cb_warn.isChecked(): allowed.add("warning")
+        if self.cb_note.isChecked(): allowed.add("note")
+
+        self.list.clear()
+        for w in self._warnings:
+            if w.severity not in allowed:
+                continue
+            blob = " ".join([w.id or "", w.message or "", w.file_path or ""]).lower()
+            if query and query not in blob:
+                continue
+            line = w.start_line if (w.start_line is not None) else "-"
+            text = f"[{w.severity}] {w.id} — {Path(w.file_path).name if w.file_path else 'Unknown'}:{line}"
+            it = QListWidgetItem(text)
+            it.setData(Qt.UserRole, w)
+            self.list.addItem(it)
+
+        if self.list.count() > 0 and self.list.currentRow() < 0:
+            self.list.setCurrentRow(0)
+
+    def _on_item_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        """Слот, который ломался — теперь он есть и показывает детали + код."""
+        w: WarningDTO | None = current.data(Qt.UserRole) if current else None
+        self._show_warning(w)
+
+    def _show_warning(self, w: WarningDTO | None) -> None:
+        """Обновляет правую панель и центр (код) под выбранную уязвимость."""
+        if not w:
+            self.code_view.clear()
+            self.msg_view.clear()
+            self.val_rule.setText("-"); self.val_sev.setText("-"); self.val_file.setText("-"); self.val_line.setText("-")
+            return
+
+        self.val_rule.setText(w.id or "-")
+        self.val_sev.setText(w.severity or "-")
+        self.val_file.setText(w.file_path or "Unknown")
+        self.val_line.setText(str(w.start_line) if w.start_line is not None else "-")
+        self.msg_view.setPlainText(w.message or "")
+
+        # центр — код из исходников
+        snippet = self.code.read_snippet(w.file_path, w.start_line, w.end_line, ctx=8)
+        self.code_view.setPlainText(snippet or "")
+
+    def _show_current(self) -> None:
+        """Перерисовать текущий элемент (после смены корня исходников и т.п.)."""
+        it = self.list.currentItem()
+        self._on_item_changed(it, None)

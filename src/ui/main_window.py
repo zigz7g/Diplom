@@ -1,249 +1,327 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Dict
+from traceback import format_exc
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
-    QListWidget, QListWidgetItem, QPlainTextEdit, QFileDialog, QMessageBox,
-    QLineEdit, QLabel, QPushButton, QCheckBox, QStatusBar, QToolBar
+    QTreeWidget, QTreeWidgetItem, QTextEdit, QLabel, QFileDialog,
+    QLineEdit, QCheckBox, QPushButton, QFormLayout, QSizePolicy,
+    QMessageBox, QDialog
 )
 
-from core.schema import WarningDTO
+from core.schema import WarningDTO, SEVERITY_COLORS
 from data.repositories.in_memory_repository import InMemoryRepository
-from services.use_cases import ImportSarifService, ImportCsvService, CodeProvider
+from services.code_provider import CodeProvider
+from services.use_cases import ImportSarifService, ImportCsvService
+from ui.code_editor import CodeEditor
+from ui.annotate_dialog import AnnotateDialog
+
+
+# ---------- helpers ----------
+
+def _read_text_best_effort(p: Path) -> str:
+    for enc in ("utf-8", "utf-8-sig", "cp1251", "windows-1251", "utf-16", "utf-32", "iso-8859-1"):
+        try:
+            return p.read_text(encoding=enc)
+        except Exception:
+            pass
+    return p.read_bytes().decode("utf-8", errors="replace")
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("SVACE Annotator")
-        self.resize(1280, 800)
+        self.setWindowTitle("SVACE Annotator — AI static report assistant")
+        self.resize(1280, 760)
 
-        # состояния / сервисы
         self.repo = InMemoryRepository()
         self.import_sarif = ImportSarifService(self.repo)
         self.import_csv = ImportCsvService(self.repo)
-        self.code = CodeProvider()
-        self._warnings: List[WarningDTO] = []
 
-        # UI
-        self._build_ui()
-        self._build_actions()
+        self.source_root: Optional[Path] = None
+        self.code = CodeProvider(None)
 
-    # ================= UI =================
-    def _build_ui(self) -> None:
-        central = QWidget(self)
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
+        # ---------- UI ----------
+        root = QWidget(self); self.setCentralWidget(root)
+        layout = QVBoxLayout(root); layout.setContentsMargins(10, 10, 10, 10); layout.setSpacing(8)
 
-        # Заголовок
-        hdr = QHBoxLayout()
-        root.addLayout(hdr)
-        hdr.addWidget(QLabel("Проект:"))
-        self.ed_project = QLineEdit()
-        self.ed_project.setPlaceholderText("Название программы / проекта")
-        hdr.addWidget(self.ed_project, 1)
-        self.lbl_snapshot = QLabel("Снимок: -")
-        hdr.addWidget(self.lbl_snapshot)
-
-        # Сплиттер
-        splitter = QSplitter(Qt.Horizontal)
-        root.addWidget(splitter, 1)
-
-        # Левая колонка — фильтры + список
-        left = QWidget(); left_l = QVBoxLayout(left); left_l.setContentsMargins(0, 0, 0, 0)
+        top = QHBoxLayout()
+        self.ed_title = QLineEdit(placeholderText="Название программы / проекта")
         self.ed_search = QLineEdit(placeholderText="Поиск по правилу / файлу / тексту…")
-        left_l.addWidget(self.ed_search)
-        row_f = QHBoxLayout()
-        self.cb_err = QCheckBox("Error"); self.cb_err.setChecked(True)
-        self.cb_warn = QCheckBox("Warning"); self.cb_warn.setChecked(True)
-        self.cb_note = QCheckBox("Note"); self.cb_note.setChecked(True)
-        btn_reset = QPushButton("Сбросить"); btn_reset.clicked.connect(self._reset_filters)
-        row_f.addWidget(self.cb_err); row_f.addWidget(self.cb_warn); row_f.addWidget(self.cb_note)
-        row_f.addStretch(1); row_f.addWidget(btn_reset)
-        left_l.addLayout(row_f)
+        self.lab_snapshot = QLabel("Снимок: —")
+        self.lab_snapshot.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lab_snapshot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        top.addWidget(self.ed_title, 2); top.addWidget(self.ed_search, 3); top.addWidget(self.lab_snapshot, 1)
+        layout.addLayout(top)
 
-        self.list = QListWidget()
-        left_l.addWidget(self.list, 1)
-        splitter.addWidget(left)
+        filters = QHBoxLayout(); filters.setSpacing(10)
+        self.cb_crit = QCheckBox("Critical"); self.cb_crit.setChecked(True)
+        self.cb_med = QCheckBox("Medium"); self.cb_med.setChecked(True)
+        self.cb_low = QCheckBox("Low"); self.cb_low.setChecked(True)
+        self.cb_info = QCheckBox("Info"); self.cb_info.setChecked(True)
+        self.cb_group = QCheckBox("Группировать по правилу"); self.cb_group.setChecked(True)
+        for cb in (self.cb_crit, self.cb_med, self.cb_low, self.cb_info, self.cb_group):
+            filters.addWidget(cb)
+        filters.addStretch(1)
+        self.btn_reset = QPushButton("Сбросить"); filters.addWidget(self.btn_reset)
+        layout.addLayout(filters)
 
-        # Центр — ТОЛЬКО код
-        self.code_view = QPlainTextEdit(); self.code_view.setReadOnly(True)
-        mono = QFont("Consolas")
-        mono.setStyleHint(QFont.Monospace); mono.setPointSize(10)
-        self.code_view.setFont(mono)
-        splitter.addWidget(self.code_view)
+        split = QSplitter(Qt.Horizontal); split.setHandleWidth(4); layout.addWidget(split, 1)
 
-        # Правая колонка — детали
-        right = QWidget(); right_l = QVBoxLayout(right); right_l.setContentsMargins(6, 6, 6, 6)
+        self.tree = QTreeWidget(); self.tree.setHeaderHidden(True); split.addWidget(self.tree)
+        self.code_view = CodeEditor(); split.addWidget(self.code_view)
 
-        def kv(key: str, tgt: QLabel) -> QWidget:
-            w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0, 0, 0, 0)
-            lab = QLabel(key); lab.setMinimumWidth(80)
-            l.addWidget(lab); l.addWidget(tgt, 1, Qt.AlignRight); return w
+        right = QWidget(); r = QVBoxLayout(right); r.setContentsMargins(8, 0, 0, 0); r.setSpacing(8)
+        form = QFormLayout()
+        self.lab_rule = QLabel("-")
+        self.lab_sev = QLabel("-")
+        self.lab_file = QLabel("-")
+        self.lab_line = QLabel("-")
+        self.lab_status = QLabel("Не обработано")
+        for lab in (self.lab_rule, self.lab_sev, self.lab_file, self.lab_line, self.lab_status):
+            lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form.addRow("Правило:", self.lab_rule)
+        form.addRow("Уровень:", self.lab_sev)
+        form.addRow("Файл:", self.lab_file)
+        form.addRow("Строка:", self.lab_line)
+        form.addRow("Статус:", self.lab_status)
+        r.addLayout(form)
 
-        self.val_rule = QLabel("-")
-        self.val_sev = QLabel("-")
-        self.val_file = QLabel("-")
-        self.val_line = QLabel("-")
-        right_l.addWidget(kv("Правило:", self.val_rule))
-        right_l.addWidget(kv("Уровень:", self.val_sev))
-        right_l.addWidget(kv("Файл:", self.val_file))
-        right_l.addWidget(kv("Строка:", self.val_line))
+        self.ed_message = QTextEdit(); self.ed_message.setReadOnly(True); self.ed_message.setMinimumHeight(70)
+        r.addWidget(self.ed_message, 1)
 
-        right_l.addWidget(QLabel("Сообщение анализатора"))
-        self.msg_view = QPlainTextEdit(); self.msg_view.setReadOnly(True)
-        right_l.addWidget(self.msg_view, 1)
+        self.ed_comment_view = QTextEdit(); self.ed_comment_view.setReadOnly(True); self.ed_comment_view.setMinimumHeight(90)
+        r.addWidget(self.ed_comment_view, 1)
 
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 0)
+        self.btn_annotate = QPushButton("Разметить…"); self.btn_annotate.setEnabled(False)
+        r.addWidget(self.btn_annotate, 0, Qt.AlignBottom)
+        split.addWidget(right)
+        split.setSizes([420, 820, 320])
 
-        # Статус-бар
-        sb = QStatusBar(); self.setStatusBar(sb)
-        self.lbl_src_root = QLabel("Исходники: не привязаны")
-        sb.addPermanentWidget(self.lbl_src_root)
+        # Меню
+        menu_file = self.menuBar().addMenu("Файл")
+        self.act_open_sarif = QAction("Открыть SARIF", self)
+        self.act_bind_src = QAction("Привязать исходники…", self)
+        menu_file.addAction(self.act_open_sarif); menu_file.addAction(self.act_bind_src)
 
         # Сигналы
-        self.list.currentItemChanged.connect(self._on_item_changed)
-        self.ed_search.textChanged.connect(self._populate_list)
-        self.cb_err.stateChanged.connect(self._populate_list)
-        self.cb_warn.stateChanged.connect(self._populate_list)
-        self.cb_note.stateChanged.connect(self._populate_list)
+        self.tree.itemSelectionChanged.connect(self._on_item_changed)
+        self.ed_search.textChanged.connect(lambda *_: self._reload_filtered())
+        for cb in (self.cb_crit, self.cb_med, self.cb_low, self.cb_info, self.cb_group):
+            cb.stateChanged.connect(lambda *_: self._reload_filtered())
+        self.btn_reset.clicked.connect(self._reset_filters)
+        self.btn_annotate.clicked.connect(self._annotate_current)
+        self.act_open_sarif.triggered.connect(self._open_sarif)
+        self.act_bind_src.triggered.connect(self._pick_source_root)
 
-    def _build_actions(self) -> None:
-        tb = QToolBar("Main"); self.addToolBar(tb)
+        self._all: List[WarningDTO] = []
+        self._reload_filtered()
 
-        act_open_sarif = QAction("Открыть SARIF", self)
-        act_open_csv = QAction("Открыть CSV/TSV", self)
-        act_bind_src = QAction("Привязать исходники…", self)
-        act_new = QAction("Новый проект", self)
+    # ---------- actions ----------
 
-        act_open_sarif.triggered.connect(self._open_sarif)
-        act_open_csv.triggered.connect(self._open_csv)
-        act_bind_src.triggered.connect(self._pick_sources_root)
-        act_new.triggered.connect(self._new_project)
+    def _reset_filters(self) -> None:
+        self.ed_search.clear()
+        for cb in (self.cb_crit, self.cb_med, self.cb_low, self.cb_info):
+            cb.setChecked(True)
 
-        for a in (act_open_sarif, act_open_csv, act_bind_src, act_new):
-            tb.addAction(a)
+    def set_snapshot_name(self, name: str) -> None:
+        self.lab_snapshot.setText(f"Снимок: {name}")
 
-        m_file = self.menuBar().addMenu("Файл")
-        m_file.addAction(act_open_sarif)
-        m_file.addAction(act_open_csv)
-        m_file.addSeparator()
-        m_file.addAction(act_bind_src)
-        m_file.addSeparator()
-        m_file.addAction(act_new)
+    def load_items(self, items: List[WarningDTO]) -> None:
+        self._all = list(items)
+        self._reload_filtered()
 
-    # ============== Команды ==============
-    def _new_project(self) -> None:
-        self.repo.replace_all([])
-        self._warnings.clear()
-        self.list.clear(); self.code_view.clear(); self.msg_view.clear()
-        self.val_rule.setText("-"); self.val_sev.setText("-"); self.val_file.setText("-"); self.val_line.setText("-")
-        self.lbl_snapshot.setText("Снимок: -")
-
-    def _open_sarif(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите SARIF JSON", "", "JSON/SARIF (*.json *.sarif)")
+    def _open_sarif(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть SARIF", "", "SARIF/JSON (*.sarif *.json);;All (*.*)")
         if not path:
             return
         try:
             n = self.import_sarif.run(path)
-            self._warnings = self.repo.list_all()
-            self.lbl_snapshot.setText(f"Снимок: {Path(path).name}")
-            self._populate_list()
             QMessageBox.information(self, "Импорт SARIF", f"Загружено записей: {n}")
-            if self.lbl_src_root.text().endswith("не привязаны"):
-                self._pick_sources_root(quiet=True)
+            self.set_snapshot_name(Path(path).name)
+            self.load_items(self.repo.list_all())
+
+            # Привязать исходники сразу после импорта (если не задано)
+            if not self.source_root:
+                if QMessageBox.question(
+                    self, "Исходники",
+                    "Привязать каталог исходников для подсветки строк?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+                ) == QMessageBox.Yes:
+                    self._pick_source_root()
+
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка импорта", str(e))
+            QMessageBox.critical(self, "Ошибка импорта SARIF", f"{e}\n\n{format_exc()}")
 
-    def _open_csv(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите CSV/TSV", "", "CSV/TSV/TXT (*.csv *.tsv *.txt)")
-        if not path:
+    def _pick_source_root(self) -> None:
+        dir_ = QFileDialog.getExistingDirectory(self, "Выбрать корень исходников", "")
+        if not dir_:
             return
-        try:
-            n = self.import_csv.run(path)
-            self._warnings = self.repo.list_all()
-            self.lbl_snapshot.setText(f"Снимок: {Path(path).name}")
-            self._populate_list()
-            QMessageBox.information(self, "Импорт CSV/TSV", f"Загружено записей: {n}")
-            if self.lbl_src_root.text().endswith("не привязаны"):
-                self._pick_sources_root(quiet=True)
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка импорта", str(e))
+        self.source_root = Path(dir_)
+        self.code.set_root(self.source_root)
+        QMessageBox.information(self, "Исходники", f"Привязан каталог исходников:\n{self.source_root}")
 
-    def _pick_sources_root(self, quiet: bool = False) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Укажите корневую папку исходников")
-        if not d:
-            if not quiet:
-                QMessageBox.information(self, "Исходники",
-                                        "Можно привязать исходники позже: Файл → Привязать исходники…")
-            return
-        self.code.set_root(d)
-        self.lbl_src_root.setText(f"Исходники: {d}")
-        self._show_current()
+    # ---------- list render ----------
 
-    # ============== Список / отображение ==============
-    def _reset_filters(self) -> None:
-        self.ed_search.clear()
-        self.cb_err.setChecked(True)
-        self.cb_warn.setChecked(True)
-        self.cb_note.setChecked(True)
-        self._populate_list()
+    def _reload_filtered(self) -> None:
+        text = self.ed_search.text().strip().lower()
+        enabled = {
+            "critical": self.cb_crit.isChecked(),
+            "medium": self.cb_med.isChecked(),
+            "low": self.cb_low.isChecked(),
+            "info": self.cb_info.isChecked(),
+        }
 
-    def _populate_list(self) -> None:
-        """Перестроить список уязвимостей с учётом фильтров и поиска."""
-        query = (self.ed_search.text() or "").lower().strip()
-        allowed = set()
-        if self.cb_err.isChecked(): allowed.add("error")
-        if self.cb_warn.isChecked(): allowed.add("warning")
-        if self.cb_note.isChecked(): allowed.add("note")
-
-        self.list.clear()
-        for w in self._warnings:
-            if w.severity not in allowed:
+        self.tree.clear()
+        items: List[WarningDTO] = []
+        for w in self._all:
+            sev = w.eff_severity()
+            if not enabled.get(sev, True):
                 continue
-            blob = " ".join([w.id or "", w.message or "", w.file_path or ""]).lower()
-            if query and query not in blob:
-                continue
-            line = w.start_line if (w.start_line is not None) else "-"
-            text = f"[{w.severity}] {w.id} — {Path(w.file_path).name if w.file_path else 'Unknown'}:{line}"
-            it = QListWidgetItem(text)
-            it.setData(Qt.UserRole, w)
-            self.list.addItem(it)
+            if text:
+                blob = f"{w.rule_id} {w.message} {w.file}:{getattr(w,'line','-')}".lower()
+                if text not in blob:
+                    continue
+            items.append(w)
 
-        if self.list.count() > 0 and self.list.currentRow() < 0:
-            self.list.setCurrentRow(0)
+        if self.cb_group.isChecked():
+            by_rule: Dict[str, List[WarningDTO]] = {}
+            for w in items:
+                by_rule.setdefault(w.rule_id or "(no-rule)", []).append(w)
+            for rule, warnings in sorted(by_rule.items(), key=lambda kv: kv[0].lower()):
+                head = QTreeWidgetItem([f"{rule} — {len(warnings)}"])
+                head.setFirstColumnSpanned(True); head.setData(0, Qt.UserRole, None)
+                self.tree.addTopLevelItem(head)
+                for w in warnings:
+                    leaf = QTreeWidgetItem([self._leaf_caption(w)])
+                    leaf.setData(0, Qt.UserRole, w)
+                    color = QColor(SEVERITY_COLORS.get(w.eff_severity(), "#111827"))
+                    leaf.setForeground(0, color)
+                    head.addChild(leaf)
+                head.setExpanded(True)
+        else:
+            for w in items:
+                it = QTreeWidgetItem([self._leaf_caption(w)])
+                it.setData(0, Qt.UserRole, w)
+                color = QColor(SEVERITY_COLORS.get(w.eff_severity(), "#111827"))
+                it.setForeground(0, color)
+                self.tree.addTopLevelItem(it)
 
-    def _on_item_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
-        """Слот, который ломался — теперь он есть и показывает детали + код."""
-        w: WarningDTO | None = current.data(Qt.UserRole) if current else None
-        self._show_warning(w)
+        self.btn_annotate.setEnabled(False)
+        if self.tree.topLevelItemCount() > 0:
+            first = self.tree.topLevelItem(0)
+            sel = first.child(0) if first and first.childCount() > 0 else first
+            self.tree.setCurrentItem(sel)
 
-    def _show_warning(self, w: WarningDTO | None) -> None:
-        """Обновляет правую панель и центр (код) под выбранную уязвимость."""
-        if not w:
-            self.code_view.clear()
-            self.msg_view.clear()
-            self.val_rule.setText("-"); self.val_sev.setText("-"); self.val_file.setText("-"); self.val_line.setText("-")
+    def _leaf_caption(self, w: WarningDTO) -> str:
+        mark = ""
+        if w.status == "Подтверждено": mark = "  ✔"
+        elif w.status == "Отклонено":   mark = "  ✖"
+        return f"[{w.eff_severity()}] {w.file}:{getattr(w, 'line', '-')} {mark}"
+
+    # ---------- selection ----------
+
+    def _on_item_changed(self) -> None:
+        item = self.tree.currentItem()
+        if not item:
+            self._clear_details(); return
+        w = item.data(0, Qt.UserRole)
+        if not isinstance(w, WarningDTO):
+            self._clear_details(); return
+
+        self._show_details(w)
+        self._show_snippet(w)
+        self.btn_annotate.setEnabled(True)
+
+    def _clear_details(self) -> None:
+        self.lab_rule.setText("-"); self.lab_sev.setText("-")
+        self.lab_file.setText("-"); self.lab_line.setText("-")
+        self.lab_status.setText("Не обработано")
+        self.ed_message.setPlainText(""); self.ed_comment_view.setPlainText("")
+        self.code_view.setPlainText("")
+        self.code_view.clear_highlight()
+        self.btn_annotate.setEnabled(False)
+
+    def _show_details(self, w: WarningDTO) -> None:
+        self.lab_rule.setText(w.rule_id or "-")
+        self.lab_sev.setText(w.eff_severity())
+        self.lab_file.setText(w.file or "-")
+        self.lab_line.setText(str(getattr(w, "start_line", None) or getattr(w, "line", "-")))
+        self.lab_status.setText(w.status or "Не обработано")
+        self.ed_message.setPlainText(w.message or "")
+        self.ed_comment_view.setPlainText(w.comment or "")
+
+    def _resolve_fs_path(self, w: WarningDTO) -> Optional[Path]:
+        if self.source_root is None:
+            return None
+        return self.code.find(w.file)
+
+    def _show_snippet(self, w: WarningDTO) -> None:
+        """
+        Логика показа кода:
+        1) пытаемся открыть физический файл из привязанного каталога;
+        2) если нет — показываем сниппет из SARIF и подсвечиваем целиком;
+        3) если есть файл — подсвечиваем диапазон из SARIF.
+        """
+        text_is_set = False
+
+        # 1) локальный файл
+        p = self._resolve_fs_path(w)
+        if p and p.exists():
+            try:
+                self.code_view.setPlainText(_read_text_best_effort(p))
+                text_is_set = True
+            except Exception:
+                pass
+
+        # 2) сниппет (если файла нет)
+        if not text_is_set:
+            snippet = (
+                getattr(w, "snippet_text", None)
+                or getattr(w, "snippet", None)
+                or ""
+            )
+            self.code_view.setPlainText(snippet)
+            self.code_view.clear_highlight()
+            if snippet:
+                total_lines = snippet.count("\n") + 1
+                self.code_view.highlight_range(1, 1, total_lines, None)
             return
 
-        self.val_rule.setText(w.id or "-")
-        self.val_sev.setText(w.severity or "-")
-        self.val_file.setText(w.file_path or "Unknown")
-        self.val_line.setText(str(w.start_line) if w.start_line is not None else "-")
-        self.msg_view.setPlainText(w.message or "")
+        # 3) подсветка диапазона из SARIF
+        l1 = int(getattr(w, "start_line", None) or getattr(w, "line", 1))
+        c1 = int(getattr(w, "start_col", 1) or 1)
+        l2 = int(getattr(w, "end_line", None) or l1)
+        c2 = int(getattr(w, "end_col", None) or 0)
+        if c2 == 0:
+            # если колонка не задана — подсветим всю строку
+            self.code_view.highlight_range(l1, 1, l1, None)
+        else:
+            self.code_view.highlight_range(l1, c1, l2, c2)
 
-        # центр — код из исходников
-        snippet = self.code.read_snippet(w.file_path, w.start_line, w.end_line, ctx=8)
-        self.code_view.setPlainText(snippet or "")
+    # ---------- annotate ----------
 
-    def _show_current(self) -> None:
-        """Перерисовать текущий элемент (после смены корня исходников и т.п.)."""
-        it = self.list.currentItem()
-        self._on_item_changed(it, None)
+    def _annotate_current(self) -> None:
+        item = self.tree.currentItem()
+        if not item:
+            return
+        w = item.data(0, Qt.UserRole)
+        if not isinstance(w, WarningDTO):
+            return
+
+        dlg = AnnotateDialog(self, w.status or "Не обработано", w.eff_severity(), w.comment or "")
+        if dlg.exec() == QDialog.Accepted:
+            status, sev, comment = dlg.chosen()
+            w.status = status
+            w.severity_ui = sev
+            w.comment = comment
+
+            # обновим правую панель и подпись элемента
+            self._show_details(w)
+            item.setText(0, self._leaf_caption(w))
+            item.setForeground(0, QColor(SEVERITY_COLORS.get(w.eff_severity(), "#111827")))

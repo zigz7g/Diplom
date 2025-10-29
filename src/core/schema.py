@@ -1,14 +1,37 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Optional
 
-Severity = Literal["error", "warning", "note"]
+SEVERITY_COLORS = {
+    "critical": "#DC2626",
+    "medium":   "#EA580C",
+    "low":      "#CA8A04",
+    "info":     "#0891B2",
+}
 
-@dataclass
+@dataclass(slots=True)
 class WarningDTO:
-    id: str                # ruleId
-    title: str             # читаемое имя правила (если есть)
-    message: str           # сообщение анализатора
-    severity: Severity     # error|warning|note
-    file_path: str         # относительный или абсолютный путь (как в отчёте)
-    start_line: Optional[int]  # 1-based
-    end_line: Optional[int]    # 1-based
+    # базовые поля, которые читает UI
+    rule_id: str
+    severity: str
+    file: str
+    line: int
+    message: str
+    status: str = "Не обработано"
+
+    # поля для UI и разметки
+    comment: str = ""
+    severity_ui: str = ""  # если пусто — используем severity
+
+    # координаты нахождения (для подсветки)
+    start_line: Optional[int] = None
+    start_col:  Optional[int] = None
+    end_line:   Optional[int] = None
+    end_col:    Optional[int] = None
+
+    # сниппет из SARIF (когда исходника на диске нет)
+    snippet_text: str = ""
+
+    def eff_severity(self) -> str:
+        return self.severity_ui or self.severity

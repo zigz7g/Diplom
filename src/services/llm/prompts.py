@@ -1,44 +1,35 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-from textwrap import dedent
+ANNOTATION_PROMPT_RU = """
+Ты размечаешь одно срабатывание статического анализа. Говоришь только по делу и только по переданному коду.
 
-SYSTEM_PROMPT = dedent("""
-Вы — эксперт по статическому анализу кода и безопасности.
-Ваша задача — аннотировать срабатывания правил из SARIF/отчетов:
-определить статус, уровень, краткую метку и комментарий, а также уверенность в процентах.
+Дано:
+- Правило: {rule}
+- Уровень: {level}
+- Файл: {file}
+- Строка: {line}
+- Сообщение сканера: {message}
 
-ФОРМАТ ОТВЕТА — только JSON:
-{
-  "status": "confirmed | false_positive | insufficient_evidence",
-  "severity": "critical | medium | low | info",
-  "label": "краткое имя проблемы",
-  "comment": "2–3 предложения с объяснением",
-  "confidence": 0..100
-}
-""").strip()
+Фрагмент кода (snippet):
+<<CODE>>
+{snippet}
+<<END>>
 
-def build_user_prompt(*, rule: str, level: str, file: str, line: int,
-                      message: str, snippet: str, code_text: str,
-                      around_hint: str = "") -> str:
-    code_short = code_text if len(code_text) <= 6000 else code_text[:6000] + "\n…<truncated>"
-    snippet_show = (snippet or "").strip()[:1200]
-    return dedent(f"""
-    Rule: {rule}
-    Level (report): {level}
-    File: {file}
-    Line: {line}
-    Message: {message}
+Контекст (усечённый текст файла):
+<<CONTEXT>>
+{file_text}
+<<END>>
 
-    Snippet:
-    ```
-    {snippet_show}
-    ```
+Инструкции:
+1) Реши, есть ли в приведённом фрагменте реальный путь эксплуатации согласно правилу. Опирайся только на этот код.
+2) Комментарий пиши кратко (2–4 предложения), с привязкой к строкам/токенам из кода. Без общих фраз про “нет source/sink”, “категорию none”, “непредоставлен контекст” и т.п.
+3) Если это тест/дока/CI и из кода не видно прод-пути, лучше отклонить.
+4) Верни строгий JSON без лишнего текста, ключи: 
+   {{
+     "status": "confirmed|false_positive",
+     "severity": "critical|medium|low|info",
+     "comment": "краткий разбор по коду",
+     "label": "краткий тег (XSS|SQLi|HardcodedKey|InsecureConfig|…)",
+     "confidence": 0.0-1.0
+   }}
 
-    File content (trimmed to 6000 chars):
-    ```text
-    {code_short}
-    ```
-
-    {around_hint}
-    Return strictly JSON as specified above.
-    """).strip()
+Только JSON.
+"""

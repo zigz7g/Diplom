@@ -1,93 +1,83 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
 import json
-from typing import Optional
+import os
+from typing import Any, Dict, Optional
+
+try:
+    import yandexgpt  # type: ignore
+except Exception:
+    yandexgpt = None  # type: ignore
+
 import requests
 
 
 class YandexGPTClient:
     """
-    Минималистичный HTTP-клиент к YandexGPT (foundationModels).
-    Нужны переменные:
-      - YAGPT_API_KEY  (или YA_API_KEY)
-      - YAGPT_FOLDER_ID (или YA_FOLDER_ID)
-      - YAGPT_MODEL  (необязательно; 'yandexgpt' | 'yandexgpt-lite')
-    """
+    Универсальный тонкий клиент к YandexGPT.
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        folder_id: Optional[str] = None,
-        model_name: str = "yandexgpt",
-        timeout: int = 60,
-    ) -> None:
+    Переменные окружения (fallback):
+      YAGPT_API_KEY / YA_API_KEY
+      YAGPT_FOLDER_ID / YA_FOLDER_ID
+      YAGPT_MODEL (default: 'yandexgpt-lite')
+    """
+    def __init__(self, api_key: str = "", folder_id: str = "", model_name: str = "") -> None:
         self.api_key = api_key or os.getenv("YAGPT_API_KEY") or os.getenv("YA_API_KEY") or ""
         self.folder_id = folder_id or os.getenv("YAGPT_FOLDER_ID") or os.getenv("YA_FOLDER_ID") or ""
-        self.model_name = os.getenv("YAGPT_MODEL", model_name or "yandexgpt").strip() or "yandexgpt"
-        self.timeout = timeout
+        self.model_name = model_name or os.getenv("YAGPT_MODEL") or "yandexgpt-lite"
 
+    # единая точка
+    def generate_any(self, prompt: str, **kw) -> str:
+        return self._generate_text(prompt, **kw)
+
+    # синонимы на случай старых вызовов
+    def complete(self, *a, **kw):         return self._generate_text(*a, **kw)
+    def generate(self, *a, **kw):         return self._generate_text(*a, **kw)
+    def generate_text(self, *a, **kw):    return self._generate_text(*a, **kw)
+    def chat(self, *a, **kw):             return self._generate_text(*a, **kw)
+    def completion(self, *a, **kw):       return self._generate_text(*a, **kw)
+    def invoke(self, *a, **kw):           return self._generate_text(*a, **kw)
+    def run(self, *a, **kw):              return self._generate_text(*a, **kw)
+    def predict(self, *a, **kw):          return self._generate_text(*a, **kw)
+    def text(self, *a, **kw):             return self._generate_text(*a, **kw)
+
+    def _assert_creds(self) -> None:
         if not self.api_key or not self.folder_id:
             raise RuntimeError("YandexGPTClient: api_key/folder_id not set")
 
-        # endpoint для completion (сообщения с ролями)
-        self._url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+    def _generate_text(self, prompt: str, *, temperature: float = 0.2, max_tokens: int = 800, **_) -> str:
+        self._assert_creds()
+        if yandexgpt is not None:
+            try:
+                return yandexgpt.generate(
+                    prompt=prompt, api_key=self.api_key, folder_id=self.folder_id,
+                    model=self.model_name, temperature=temperature, max_tokens=max_tokens
+                )
+            except Exception:
+                pass
 
-    def _model_uri(self) -> str:
-        # маппинг коротких имён на полные URI
-        base = "yandexgpt-lite" if "lite" in self.model_name.lower() else "yandexgpt"
-        return f"gpt://{self.folder_id}/{base}/latest"
-
-    def complete(self, prompt: str) -> str:
-        """
-        Вернёт сгенерированный текст как одну строку.
-        """
+        url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
         headers = {
             "Authorization": f"Api-Key {self.api_key}",
             "Content-Type": "application/json",
             "x-folder-id": self.folder_id,
         }
-        payload = {
-            "modelUri": self._model_uri(),
-            "completionOptions": {
-                "temperature": 0.2,
-                "maxTokens": 800,
-                "stream": False,
-            },
-            "messages": [
-                {"role": "user", "text": prompt}
-            ],
+        body = {
+            "modelUri": f"gpt://{self.folder_id}/{self.model_name}",
+            "completionOptions": {"stream": False, "temperature": temperature, "maxTokens": max_tokens},
+            "messages": [{"role": "system", "text": "You are a helpful assistant."},
+                         {"role": "user", "text": prompt}],
         }
-
-        resp = requests.post(self._url, headers=headers, data=json.dumps(payload), timeout=self.timeout)
-        if resp.status_code != 200:
-            raise RuntimeError(f"YandexGPTClient HTTP {resp.status_code}: {resp.text}")
-
-        data = resp.json()
-        # ожидаемый путь: result -> alternatives[0] -> message -> text
         try:
-            return data["result"]["alternatives"][0]["message"]["text"]
-        except Exception:
-            raise RuntimeError(f"YandexGPTClient: unexpected response: {json.dumps(data)[:500]}")
-
-    # services/llm/yagpt_client.py (добавить в класс YandexGPTClient)
-
-    def generate_any(self, prompt: str) -> str:
-        """
-        Унифицированный вызов генерации. Бросает понятную ошибку, если не настроены ключи.
-        """
-        if not (getattr(self, "api_key", None) and getattr(self, "folder_id", None)):
-            raise RuntimeError("YandexGPTClient: api_key/folder_id not set")
-
-        # пробуем известные методы клиента; возвращаем первую удачную строку
-        for name in ("complete", "generate", "generate_text", "chat", "completion", "invoke", "run", "predict", "text"):
-            fn = getattr(self, name, None)
-            if callable(fn):
-                try:
-                    out = fn(prompt)
-                    if isinstance(out, str) and out.strip():
-                        return out
-                except Exception:
-                    continue
-        raise RuntimeError("YandexGPTClient: no underlying text-generation method found")
+            r = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            alt = data.get("result", {}).get("alternatives", [{}])[0]
+            msg = alt.get("message", {}) or {}
+            txt = msg.get("text", "")
+            if not isinstance(txt, str) or not txt:
+                raise RuntimeError("empty response text")
+            return txt
+        except Exception as e:
+            raise RuntimeError(f"YandexGPTClient HTTP error: {e}") from e

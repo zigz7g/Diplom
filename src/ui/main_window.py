@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from ui.export_dialog import ExportDialog
+
 import os, json, csv
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +40,7 @@ def _read_text_best_effort(p: Path) -> str:
             pass
     return p.read_bytes().decode("utf-8", errors="replace")
 
+
 def _load_env_from_nearby(repo_hint: Optional[Path]) -> Optional[Path]:
     """
     Ищет .env в корне проекта и выше и загружает пары KEY=VALUE в os.environ,
@@ -72,7 +75,8 @@ def _load_env_from_nearby(repo_hint: Optional[Path]) -> Optional[Path]:
             pass
     return None
 
-# ---------- AI worker (в отдельном потоке) ----------
+
+# ---------- AI worker (отдельный поток) ----------
 
 class _AIWorker(QObject):
     started = Signal(int)                         # total
@@ -83,7 +87,7 @@ class _AIWorker(QObject):
     def __init__(self, annotator: AIAnnotator, warnings: List[WarningDTO], code: CodeProvider):
         super().__init__()
         self.annotator = annotator
-        self.warnings = list(warnings)
+        self.warnings = [w for w in warnings if isinstance(w, WarningDTO)]
         self.code = code
         self._stop = False
 
@@ -105,7 +109,7 @@ class _AIWorker(QObject):
                 except Exception:
                     file_text = ""
 
-                # вызов аннотатора — только через kwargs (контекст передаём явно)
+                # вызов аннотатора — передаём параметры явно
                 try:
                     res = self.annotator.annotate_one(
                         rule=getattr(w, "rule_id", "") or "",
@@ -130,6 +134,7 @@ class _AIWorker(QObject):
     def stop(self):
         self._stop = True
 
+
 # ---------- Main Window ----------
 
 class MainWindow(QMainWindow):
@@ -144,19 +149,19 @@ class MainWindow(QMainWindow):
         self.source_root: Optional[Path] = None
         self.code = CodeProvider(None)
 
-        # 1) СНАЧАЛА корень проекта и .env
+        # 1) корень проекта и .env
         try:
             self.project_root: Path = Path(__file__).resolve().parents[2]
         except Exception:
             self.project_root = Path.cwd()
         _load_env_from_nearby(self.project_root)
 
-        # 2) Каталог отчётов
+        # 2) каталог отчётов
         self.reports_dir: Path = self.project_root / "reports"
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self._snapshot_name: str = "—"
 
-        # 3) Только теперь создаём клиента LLM (переменные уже в os.environ)
+        # 3) клиент LLM после загрузки ENV
         self.ai_client = YandexGPTClient(
             api_key=os.getenv("YAGPT_API_KEY") or os.getenv("YA_API_KEY") or "",
             folder_id=os.getenv("YAGPT_FOLDER_ID") or os.getenv("YA_FOLDER_ID") or "",
@@ -196,7 +201,7 @@ class MainWindow(QMainWindow):
 
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
-        self.tree.setSelectionMode(QTreeWidget.ExtendedSelection)  # мультивыделение
+        self.tree.setSelectionMode(QTreeWidget.ExtendedSelection)
         split.addWidget(self.tree)
 
         self.code_view = CodeEditor(); split.addWidget(self.code_view)
@@ -248,11 +253,12 @@ class MainWindow(QMainWindow):
         menu_project.addAction(self.act_ai_all_filtered)
         menu_project.addAction(self.act_ai_whole)
 
+        # ЕДИНЫЙ экспорт
         menu_export = self.menuBar().addMenu("Экспорт")
-        self.act_export_ai_csv = QAction("Экспорт AI → CSV…", self)
-        menu_export.addAction(self.act_export_ai_csv)
+        self.act_export_unified = QAction("Экспорт…", self)
+        menu_export.addAction(self.act_export_unified)
 
-        # Лёгкий тёмный стиль интерфейса
+        # Стиль
         self.setStyleSheet("""
         QMainWindow { background: #f8fafc; }
         QLineEdit, QTextEdit { background:#ffffff; border:1px solid #E5E7EB; border-radius:8px; padding:6px 10px; }
@@ -274,8 +280,8 @@ class MainWindow(QMainWindow):
             cb.stateChanged.connect(lambda *_: self._reload_filtered())
         self.btn_reset.clicked.connect(self._reset_filters)
 
-        self.btn_ai.clicked.connect(self._ai_clicked)              # выделенная запись
-        self.btn_annotate.clicked.connect(self._annotate_current)  # ручная разметка
+        self.btn_ai.clicked.connect(self._ai_clicked)
+        self.btn_annotate.clicked.connect(self._annotate_current)
 
         self.act_open_sarif.triggered.connect(self._open_sarif)
         self.act_bind_src.triggered.connect(self._pick_source_root)
@@ -283,7 +289,8 @@ class MainWindow(QMainWindow):
         self.act_ai_selected.triggered.connect(self._ai_clicked)
         self.act_ai_all_filtered.triggered.connect(self._ai_clicked_all)
         self.act_ai_whole.triggered.connect(self._ai_clicked_whole)
-        self.act_export_ai_csv.triggered.connect(self._export_ai_csv_dialog)
+
+        self.act_export_unified.triggered.connect(self._open_export_dialog)
 
         # состояние
         self._all: List[WarningDTO] = []
@@ -506,7 +513,6 @@ class MainWindow(QMainWindow):
         1) если нашли файл — показываем его и подсвечиваем диапазон из SARIF;
         2) если нет — показываем сниппет и подсвечиваем его целиком.
         """
-        # Попробуем открыть реальный файл
         p = self._resolve_fs_path(w)
         if p and p.exists():
             try:
@@ -516,25 +522,21 @@ class MainWindow(QMainWindow):
                 text = ""
                 self.code_view.setPlainText(text)
 
-            # Диапазон из SARIF (с валидацией)
             l1 = int(getattr(w, "start_line", None) or getattr(w, "line", 1) or 1)
             c1 = int(getattr(w, "start_col", 1) or 1)
             l2 = int(getattr(w, "end_line", None) or l1 or 1)
             c2 = int(getattr(w, "end_col", None) or 0)
 
-            # Нормализация диапазона по тексту файла
             total_lines = (text.count("\n") + 1) if text else 1
             l1 = max(1, min(l1, total_lines))
             l2 = max(l1, min(l2, total_lines))
             c1 = max(1, c1)
             if c2 == 0:
-                # до конца строки
                 self.code_view.highlight_range(l1, c1, l1, None)
             else:
                 self.code_view.highlight_range(l1, c1, l2, max(c1, c2))
             return
 
-        # Файл не нашли — fallback на сниппет
         snippet = (getattr(w, "snippet_text", None) or getattr(w, "snippet", None) or "")
         self.code_view.setPlainText(snippet)
         self.code_view.clear_highlight()
@@ -560,10 +562,11 @@ class MainWindow(QMainWindow):
             w.severity_ui = sev
             w.comment = comment
 
-            # обновим правую панель и подпись элемента
             self._show_details(w)
-            item.setText(0, self._leaf_caption(w))
-            item.setForeground(0, QColor(SEVERITY_COLORS.get(w.eff_severity(), "#111827")))
+            it = self._warn_item_map.get(id(w))
+            if it:
+                it.setText(0, self._leaf_caption(w))
+                it.setForeground(0, QColor(SEVERITY_COLORS.get(w.eff_severity(), "#111827")))
 
     # ---------- AI разметка ----------
 
@@ -637,10 +640,8 @@ class MainWindow(QMainWindow):
         self._apply_ai_result(w, res)
         self._update_tree_item(w)
 
-        # помечаем как размеченное нейросетью
         self._ai_marked.add(id(w))
 
-        # процент уверенности в статус-бар
         conf_raw = res.get("confidence", 0)
         try:
             conf_val = float(conf_raw)
@@ -649,7 +650,6 @@ class MainWindow(QMainWindow):
         conf_pct = int(round(conf_val * 100)) if conf_val <= 1.0 else int(round(conf_val))
         self.statusBar().showMessage(f"AI: {getattr(w,'status','Не обработано')}, {w.eff_severity()} • {conf_pct}%", 3000)
 
-        # автообновление latest JSON/CSV
         self._export_results_auto(final=False)
         self._export_ai_csv_latest()
 
@@ -667,7 +667,6 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_ai_thread"):
             self._ai_thread.quit()
             self._ai_thread.wait(500)
-        # снапшоты
         self._export_results_auto(final=True)
         self._export_ai_csv_snapshot()
 
@@ -678,8 +677,16 @@ class MainWindow(QMainWindow):
     # ---- нормализация результата LLM ----
 
     def _coerce_ai_result(self, res: Any) -> Dict[str, Any]:
+        # поддержка dict / объекта / tuple / прочих значений
         if isinstance(res, dict):
             src = res
+        elif isinstance(res, (list, tuple)) and len(res) >= 3:
+            # ожидаем (status, severity, comment, [confidence], [label])
+            status, severity, comment = res[0], res[1], res[2]
+            confidence = res[3] if len(res) > 3 else 0
+            label = res[4] if len(res) > 4 else ""
+            src = {"status": status, "severity": severity, "comment": comment,
+                   "confidence": confidence, "label": label}
         else:
             src = {
                 "status": getattr(res, "status", ""),
@@ -688,9 +695,10 @@ class MainWindow(QMainWindow):
                 "confidence": getattr(res, "confidence", 0),
                 "label": getattr(res, "label", ""),
             }
+
         status = str(src.get("status", "")).lower()
         if status not in {"confirmed", "false_positive"}:
-            status = "false_positive"  # никаких «insufficient»
+            status = "false_positive"
         sev = str(src.get("severity", "")).lower()
         if sev not in {"critical", "medium", "low", "info"}:
             sev = "info"
@@ -721,7 +729,6 @@ class MainWindow(QMainWindow):
         comment = res_dict.get("comment") or ""
         w.comment = (f"[{label}] " if label else "") + comment
 
-        # сохраняем уверенность (0..1)
         if hasattr(w, "ml_confidence"):
             try:
                 w.ml_confidence = float(res_dict.get("confidence", 0.0))
@@ -806,7 +813,7 @@ class MainWindow(QMainWindow):
                 w.message or "",
                 getattr(w, "status", "Не обработано"),
                 getattr(w, "comment", ""),
-                f"{int(round(conf*100))}",  # percent
+                f"{int(round(conf*100))}",
             ])
         return rows
 
@@ -831,16 +838,31 @@ class MainWindow(QMainWindow):
         self._write_csv(path, rows)
         return path
 
-    def _export_ai_csv_dialog(self) -> None:
-        rows = self._collect_ai_rows()
-        if not rows:
-            QMessageBox.information(self, "Экспорт AI → CSV", "Пока нет записей, размеченных нейросетью.")
-            return
-        self.reports_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%М-%S")
-        default = str(self.reports_dir / f"ai_results_{ts}.csv")
-        path, _ = QFileDialog.getSaveFileName(self, "Сохранить CSV", default, "CSV (*.csv)")
-        if not path:
-            return
-        self._write_csv(Path(path), rows)
-        QMessageBox.information(self, "Экспорт AI → CSV", f"Готово:\n{path}")
+    # единый экспорт (диалог)
+    def _open_export_dialog(self):
+        def collect_warnings():
+            if hasattr(self.repo, "all"):
+                return list(self.repo.all())
+            for name in ("iter_all", "iter_warnings", "items"):
+                if hasattr(self.repo, name):
+                    obj = getattr(self.repo, name)
+                    data = obj() if callable(obj) else obj
+                    return list(data)
+            return []
+
+        def collect_pairs():
+            """
+            Вернуть (warning, ai_result_dict). Если у тебя есть свой словарь
+            результатов, замени здесь на свою структуру.
+            """
+            pairs = []
+            warnings = collect_warnings()
+            ai_map = getattr(self, "ai_results", {}) or {}
+            for w in warnings:
+                wid = getattr(w, "id", None) or getattr(w, "rule_id", None)
+                a = ai_map.get(wid, {})
+                pairs.append((w, a))
+            return pairs
+
+        dlg = ExportDialog(self, collect_warnings, collect_pairs, self.reports_dir)
+        dlg.exec()

@@ -3,39 +3,73 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+import time
+from typing import Any, Dict, Optional
 
 from services.analysis.heuristics import analyze_warning
-from services.llm.yagpt_client import YandexGPTClient
+from services.llm.prompts import build_annotation_prompt
 
 
-JSON_RE = re.compile(r"\{.*\}", re.S)
+_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
-@dataclass
-class AIResult:
-    status: str
-    label: str
-    comment: str
-    confidence: float = 0.0
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {"status": self.status, "label": self.label, "comment": self.comment, "confidence": self.confidence}
+def _extract_json(text: str) -> Dict[str, Any]:
+    """
+    Достаём первый валидный JSON-объект из ответа.
+    """
+    if not text:
+        raise ValueError("empty LLM response")
+    m = _JSON_RE.search(text)
+    if not m:
+        raise ValueError("no JSON object found")
+    payload = m.group(0)
+    return json.loads(payload)
 
 
 class AIAnnotator:
-    def __init__(self, client: Optional[YandexGPTClient] = None) -> None:
-        self.client = client or YandexGPTClient()
+    """
+    Обёртка над LLM-клиентом: резистентно вызывает метод генерации, склеивает эвристику и ответ.
+    Требование интерфейса: возвращать строго dict со свойствами:
+      status, severity, label, confidence, comment.
+    """
 
-    # Совместимость со старыми вызовами: вернуть (ok, payload)
-    def annotate(self, **kwargs) -> Tuple[bool, Dict[str, Any]]:
-        try:
-            return True, self.annotate_one(**kwargs)
-        except Exception as e:
-            return False, {"status": "Не обработано", "label": "Ошибка", "comment": str(e), "confidence": 0.0}
+    def __init__(self, client: Any):
+        self.client = client
 
-    # Универсальный вход: принимает WarningDTO поля через kwargs
+    # ——— внутренний вызов LLM со списком кандидатных методов (во избежание "no usable method") ———
+    def _call_llm(self, prompt: str) -> str:
+        last_err = None
+        for method_name in ("complete", "generate", "generate_text", "completion", "invoke", "run", "predict", "text"):
+            fn = getattr(self.client, method_name, None)
+            if not callable(fn):
+                continue
+            try:
+                # некоторые клиенты возвращают объект {text: "..."} / {choices:[...]} — нормализуем
+                out = fn(prompt)
+                if isinstance(out, str):
+                    return out
+                if isinstance(out, dict):
+                    if "text" in out and isinstance(out["text"], str):
+                        return out["text"]
+                    if "choices" in out and out["choices"]:
+                        # chat-like
+                        ch0 = out["choices"][0]
+                        if isinstance(ch0, dict):
+                            msg = ch0.get("message") or {}
+                            if isinstance(msg, dict) and "content" in msg:
+                                return msg["content"]
+                            # на всякий случай
+                            if "text" in ch0:
+                                return ch0["text"]
+                # fallback: приведение к строке
+                return str(out)
+            except Exception as e:
+                last_err = e
+                # ретраим на transient ошибках (включая HTTP 5xx)
+                time.sleep(0.4)
+                continue
+        raise RuntimeError(f"LLM call failed: {last_err or 'no method available'}")
+
     def annotate_one(
         self,
         *,
@@ -45,96 +79,80 @@ class AIAnnotator:
         line: int,
         message: str,
         snippet: str,
-        file_text: str = "",
+        file_text: str,
     ) -> Dict[str, Any]:
-        rule = rule or ""
-        level = level or "info"
-        file = file or "-"
-        line = int(line or 0)
-        message = message or ""
-        snippet = snippet or ""
+        """
+        Единая точка — всегда возвращает валидный dict.
+        """
+        # 1) Лёгкая эвристика пути
+        heur = analyze_warning(file=file, rule_id=rule, message=message).to_dict()
 
-        # 1) Быстрые эвристики
-        h = analyze_warning(rule=rule, level=level, file=file, line=line, message=message, snippet=snippet, file_text=file_text)
-        act = h.get("action")
-        if act == "reject":
-            return AIResult("Отклонено", h.get("label", "Не уязвимость"), h.get("comment", ""), h.get("confidence", 0.0)).as_dict()
-        if act == "confirm":
-            return AIResult("Подтверждено", h.get("label", "Уязвимость"), h.get("comment", ""), h.get("confidence", 0.0)).as_dict()
-
-        # 2) LLM
-        prompt = self._build_prompt(rule, level, file, line, message, snippet, file_text)
-        raw = self.client.generate_any(prompt, temperature=0.2, max_tokens=600)
-
-        data = self._safe_parse_json(raw)
-        if not data:
-            short = self._guess_short_label(rule, snippet)
-            long = self._fallback_comment(rule, line, snippet)
-            return AIResult("Не обработано", short, long, 0.1).as_dict()
-
-        status_map = {
-            "confirmed": "Подтверждено",
-            "false_positive": "Отклонено",
-            "info": "Не обработано",
+        ctx: Dict[str, Any] = {
+            "rule_id": rule or "",
+            "level": level or "info",
+            "file": file or "-",
+            "line": int(line or 0),
+            "message": message or "",
+            "snippet": snippet or "",
+            "file_text": file_text or "",
         }
-        status = status_map.get(str(data.get("status", "")).lower(), "Не обработано")
-        label = str(data.get("label") or self._guess_short_label(rule, snippet))
-        comment = str(data.get("comment") or "").strip()
-        if not comment:
-            comment = self._fallback_comment(rule, line, snippet)
 
-        return AIResult(status, label, comment, float(data.get("confidence") or 0.0)).as_dict()
+        # 2) Если хочется полностью «коротко-замкнуть» — можно принудительно вернуть эвристику
+        # Сейчас принуждаем только если очень уверены, но по умолчанию даём LLM шанс
+        force_only_heur = False
 
-    # ---------- helpers ----------
+        if force_only_heur:
+            return {
+                "status": heur["status"],
+                "severity": heur["severity"],
+                "label": heur["label"],
+                "confidence": heur["confidence"],
+                "comment": heur["comment"],
+            }
 
-    def _build_prompt(self, rule: str, level: str, file: str, line: int, message: str, snippet: str, file_text: str) -> str:
-        return f"""
-You are a security code reviewer. Analyze ONLY the provided code and rule. 
-Return a single compact JSON and NOTHING else.
+        # 3) Строим промпт с учётом эвристик
+        prompt = build_annotation_prompt(ctx, heur)
 
-Rule: {rule}
-Severity: {level}
-File: {file}
-Line: {line}
-Scanner message: {message}
-
-Code snippet (exact line shown with >>> markers if possible):
->>> {snippet}
-
-If necessary, short context of the file:
-{file_text[:2000]}
-
-Instructions:
-- Base your judgement on this code only. Do not discuss generic "source/sink" pipelines.
-- If it's documentation or a test fixture (textual or non-executable), say why THIS line is not exploitable.
-- Be concrete: mention variable names, operations, and why (2–4 sentences). No meta-commentary.
-- Output JSON with the following schema:
-
-{{
-  "status": "confirmed|false_positive|info",
-  "label": "short label 2–6 words",
-  "comment": "2–4 sentences grounded in the snippet; no generic advice.",
-  "confidence": 0.0
-}}
-        """.strip()
-
-    def _safe_parse_json(self, text: str) -> Dict[str, Any]:
-        m = JSON_RE.search(text or "")
-        if not m:
-            return {}
+        # 4) Зовём LLM и парсим JSON. Если что-то пошло не так — используем эвристику.
         try:
-            obj = json.loads(m.group(0))
-            if isinstance(obj, dict):
-                return obj
+            raw = self._call_llm(prompt)
+            parsed = _extract_json(raw)
         except Exception:
-            pass
-        return {}
+            parsed = {
+                "status": heur["status"],
+                "severity": heur["severity"],
+                "label": heur["label"],
+                "confidence": heur["confidence"],
+                "comment": heur["comment"],
+            }
 
-    def _guess_short_label(self, rule: str, snippet: str) -> str:
-        if "extra(" in snippet or ".raw(" in snippet:
-            return "SQLi: dynamic query"
-        return (rule or "Issue").replace("_", " ").title()[:60]
+        # 5) Нормализация / «overrides» на базе эвристик пути (чтобы статус и комментарий не противоречили)
+        # Если файл явно non_prod, а LLM вдруг «confirmed», мягко опустим до FP и скорректируем комментарий.
+        if "non_prod_path" in heur.get("flags", []) and parsed.get("status") == "confirmed":
+            parsed["status"] = "false_positive"
+            parsed["severity"] = "info"
+            # объединяем причину из LLM (если была предметная) с явной ссылкой на непроизводственный путь
+            base_comment = parsed.get("comment") or ""
+            suffix = " Файл относится к непроизводственному пути (docs/tests/examples/fixtures/locale), поэтому срабатывание не влияет на прод."
+            parsed["comment"] = (base_comment + " " + suffix).strip()
+            parsed["confidence"] = max(float(parsed.get("confidence") or 0.5), 0.8)
 
-    def _fallback_comment(self, rule: str, line: int, snippet: str) -> str:
-        sn = snippet.strip().replace("\n", " ")
-        return f"Правило {rule}. Строка {line}: проверьте выражение «{sn[:120]}». Нужна ручная проверка для корректной классификации."
+        # 6) Значения по умолчанию/валидация
+        parsed["status"] = parsed.get("status") in ("confirmed", "false_positive") and parsed["status"] or heur["status"]
+        parsed["severity"] = parsed.get("severity") in ("critical", "medium", "low", "info") and parsed["severity"] or heur["severity"]
+        parsed["label"] = parsed.get("label") or heur["label"]
+        try:
+            parsed["confidence"] = float(parsed.get("confidence", 0.6))
+        except Exception:
+            parsed["confidence"] = 0.6
+        parsed["comment"] = (parsed.get("comment") or "").strip()
+
+        # Финальная страховка: комментарий должен ссылаться на код/файл/строку
+        if not parsed["comment"]:
+            parsed["comment"] = f"Разбор {rule} в {file}:{line}: требуется ручная проверка по месту использования."
+        else:
+            # если совсем нет конкретики — мягко подталкиваем
+            if all(k not in parsed["comment"] for k in (str(line), "(", ")", "=", ".", "[", "]")):
+                parsed["comment"] += f" (см. {file}:{line})"
+
+        return parsed

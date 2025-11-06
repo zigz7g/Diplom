@@ -1,101 +1,107 @@
 # -*- coding: utf-8 -*-
-"""
-Быстрые эвристики для авторазметки без LLM.
-
-Возвращает словарь вида:
-{
-    "action": "reject" | "confirm" | "skip" | "ai",
-    "label": "краткий тэг",
-    "comment": "подробный комментарий",
-    "confidence": 0.0..1.0
-}
-"""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Optional
+import re
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional, Tuple
 
 
-DOC_HINTS = ("docs/", "/docs/", "documentation", "readme", "changelog")
-TEST_HINTS = ("/tests/", "tests/", "/test_", "_tests/", "_test.py", "/test/", "fixtures/", "migrations/")
-VENDOR_HINTS = ("/site-packages/", "/dist-packages/")
+_NON_PROD_DIR_RE = re.compile(
+    r"(?:^|/)(tests?|test_|docs|examples?|example_|sample_|fixtures?|locale/|i18n/|po/)"
+    r"(?:/|$)",
+    re.IGNORECASE,
+)
 
-SAFE_EXTS = (".txt", ".rst", ".md", ".yml", ".yaml", ".toml", ".ini")
+# Файлы «локализаций» часто подсвечивают строки, не имеющие отношения к исполнению кода
+_LOCALE_FILE_RE = re.compile(r"(?:/LC_MESSAGES/|\.po$|\.pot$|/locale/)", re.IGNORECASE)
 
-# Правила, которые почти всегда FP в доках/тестах
-RULES_FP_IN_DOCS = {
-    "CONFIG_CRYPTO_KEY_NULL",
-    "CONFIG_CRYPTO_KEY_EMPTY",
-    "CONFIG_CRYPTO_KEY_HARDCODED",
-    "CONFIG_PASSWORD_HARDCODED",
-    "HTML_CRYPTO_MISSING_STEP",
+# Мини-карта правил -> «ярлык» по умолчанию (если LLM не сможет проставить)
+_DEFAULT_LABEL_BY_RULE_PREFIX = {
+    "XSS": "XSS",
+    "SQL": "SQLi",
+    "INJECTION": "Injection",
+    "PASSWORD": "InsecureConfig",
+    "CRYPTO": "HardcodedKey",
+    "CONFIG": "InsecureConfig",
+    "DESERIALIZATION": "UnsafeDeserialization",
 }
 
 
-def _is_textual_snippet(snippet: str) -> bool:
-    s = (snippet or "").strip()
-    if not s:
-        return False
-    return s.startswith("* ") or s.startswith(".. ") or s.startswith("# ") and "sample" in s.lower()
+@dataclass
+class HeuristicsResult:
+    path_class: str                 # 'non_prod' | 'prod' | 'unknown'
+    forced: bool                    # если True — LLM лучше не звать, решение окончательное
+    status: str                     # 'false_positive' | 'confirmed' | 'info'
+    severity: str                   # 'info'|'low'|'medium'|'critical'
+    label: str                      # короткий ярлык
+    comment: str                    # краткое объяснение на основе пути/контекста
+    confidence: float               # 0..1
+    flags: Tuple[str, ...]          # дополнительные флаги для промпта/журнала
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["flags"] = list(self.flags)
+        return d
 
 
-def analyze_warning(
-    *,
-    rule: str,
-    level: str,
-    file: str,
-    line: int,
-    message: str,
-    snippet: str,
-    file_text: str = "",
-) -> Dict:
+def _guess_label(rule_id: str) -> str:
+    r = (rule_id or "").upper()
+    for pref, lab in _DEFAULT_LABEL_BY_RULE_PREFIX.items():
+        if pref in r:
+            return lab
+    return "InsecureFinding"
+
+
+def analyze_warning(*, file: str, rule_id: str, message: str) -> HeuristicsResult:
     """
-    Возвращает auto-решение или 'ai', если нужно звать LLM.
+    Лёгкая эвристика до LLM, чтобы:
+    1) моментально отсечь тесты/доки/локализации как FP;
+    2) дать LLM контекст (flags), но не навязывать шаблонных фраз.
     """
     path = file or ""
-    rule = (rule or "").upper()
-    level = (level or "info").lower()
-    snippet = snippet or ""
+    flags = []
 
-    # 1) Отфильтровать явные не-прод файлы
-    path_l = path.lower()
-    if path_l.endswith(SAFE_EXTS) or any(h in path_l for h in DOC_HINTS):
-        if rule in RULES_FP_IN_DOCS or _is_textual_snippet(snippet):
-            return {
-                "action": "reject",
-                "label": "Документация/пример",
-                "comment": f"Строка {line}: фрагмент описательного текста («{snippet[:64]}»), а не исполняемый код. Правило {rule} тут неприменимо.",
-                "confidence": 0.95,
-            }
+    # По умолчанию — считаем прод, неизвестную важность «info»
+    path_class = "prod"
+    status = "confirmed"
+    severity = "info"
+    forced = False
+    label = _guess_label(rule_id)
 
-    if any(h in path_l for h in TEST_HINTS):
-        if rule in RULES_FP_IN_DOCS:
-            return {
-                "action": "reject",
-                "label": "Тестовый код",
-                "comment": f"Строка {line}: тестовый сценарий использует фиктивные значения; по смыслу это не уязвимость в прод-коде.",
-                "confidence": 0.9,
-            }
+    # Некоторые классы путей считаем непроизводственными
+    if _NON_PROD_DIR_RE.search(path):
+        path_class = "non_prod"
+        status = "false_positive"
+        severity = "info"
+        forced = False  # не принуждаем, т.к. иногда в tests бывает рабочий пример
+        flags.append("non_prod_path")
 
-    if any(h in path_l for h in VENDOR_HINTS):
-        return {
-            "action": "reject",
-            "label": "Сторонний код",
-            "comment": "Находится в стороннем пакете; размечается отдельно от проекта.",
-            "confidence": 0.8,
-        }
+    if _LOCALE_FILE_RE.search(path):
+        flags.append("locale_like")
 
-    # 2) Простые подтверждения по сигнатурам
-    if rule == "PYTHON_INJECTION_SQL":
-        sn = snippet.replace(" ", "")
-        if ".extra(" in sn or ".raw(" in sn or ("SELECT" in snippet and " % " in snippet):
-            return {
-                "action": "confirm",
-                "label": "SQLi: конкатенация",
-                "comment": f"Строка {line}: SQL выражение собирается динамически ({snippet.strip()[:80]}). При поступлении непроверенных данных возможно внедрение.",
-                "confidence": 0.75,
-            }
+    # Если правило из «CONFIG_*» или «*_KEY_*» — понижаем серьёзность в non_prod
+    if path_class == "non_prod" and ("KEY" in (rule_id or "").upper() or "CONFIG" in (rule_id or "").upper()):
+        severity = "info"
+        status = "false_positive"
 
-    # 3) По умолчанию — в LLM
-    return {"action": "ai", "label": "", "comment": "", "confidence": 0.0}
+    # Комментарий — короткая, но конкретная причина (используемая, если LLM не звать/сломался)
+    if path_class == "non_prod":
+        comment = (
+            "Файл находится в непроизводственном пути (docs/tests/examples/fixtures/locale). "
+            "Фрагмент предназначен для документации или тестов и не участвует в исполнении в проде."
+        )
+        confidence = 0.95
+    else:
+        comment = "Потенциальная уязвимость требует анализа кода по месту использования."
+        confidence = 0.4
+
+    return HeuristicsResult(
+        path_class=path_class,
+        forced=forced,
+        status=status,
+        severity=severity,
+        label=label,
+        comment=comment,
+        confidence=confidence,
+        flags=tuple(flags),
+    )

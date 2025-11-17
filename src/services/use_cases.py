@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
 from core.schema import WarningDTO
 from services import sarif_reader
 
@@ -9,32 +7,25 @@ class ImportSarifService:
 
     def run(self, path: str) -> int:
         data = sarif_reader.load_sarif(path)
-        n = 0
-        for item in sarif_reader.iter_results(data):
+        items = list(sarif_reader.iter_results(data))
+        self.repo.clear()
+        count = 0
+        for item in items:
             w = WarningDTO(
                 rule_id=item["rule"],
                 severity=item["severity"],
-                file=item["file"],
-                line=int(item["start_line"] or 1),
-                message=item["message"],
+                file_path=item["file"] or "",
+                start_line=item["start_line"],
+                message=item["message"] or "",
+                code_snippet=item.get("snippet") or "",
+                start_col=item.get("start_col"),
+                end_line=item.get("end_line"),
+                end_col=item.get("end_col"),
+                snippet_text=item.get("snippet") or "",
                 status="Не обработано",
             )
-            # координаты + сниппет
-            w.start_line = item["start_line"]
-            w.start_col  = item["start_col"]
-            w.end_line   = item["end_line"]
-            w.end_col    = item["end_col"]
-            w.snippet_text = item["snippet"] or ""
+            # отразить исходный уровень в UI, чтобы сразу была окраска
             w.severity_ui = w.severity
-            w.comment = ""
-
-            try:
-                self.repo.add(w)
-            except Exception:
-                self.repo.items.append(w)  # in-memory fallback
-            n += 1
-        return n
-
-class ImportCsvService:
-    def __init__(self, repo): self.repo = repo
-    def run(self, path: str) -> int: return 0
+            self.repo.add(w)
+            count += 1
+        return count

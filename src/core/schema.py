@@ -12,19 +12,19 @@ SEVERITY_COLORS = {
 
 @dataclass(slots=True)
 class WarningDTO:
-    # базовые поля, которые читает UI
+    # базовые поля
     rule_id: str
     severity: str
-    file: str
-    line: int
+    file_path: str
     message: str
-    status: str = "Не обработано"
+    code_snippet: str = ""
 
-    # поля для UI и разметки
+    # статус разметки
+    status: str = "Не обработано"   # "Подтверждено" | "Отклонено" | "Не обработано"
     comment: str = ""
-    severity_ui: str = ""  # если пусто — используем severity
+    severity_ui: str = ""           # если пусто — используем severity
 
-    # координаты нахождения (для подсветки)
+    # координаты (для подсветки)
     start_line: Optional[int] = None
     start_col:  Optional[int] = None
     end_line:   Optional[int] = None
@@ -32,6 +32,12 @@ class WarningDTO:
 
     # сниппет из SARIF (когда исходника на диске нет)
     snippet_text: str = ""
+
+    # --- AI/ML метаданные ---
+    ml_model: str = ""
+    ml_label: str = ""         # 'confirmed'|'rejected'|'needs_review'
+    ml_confidence: float = 0.0 # 0..1
+    ml_reason: str = ""
 
     def eff_severity(self) -> str:
         return self.severity_ui or self.severity

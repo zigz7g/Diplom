@@ -1,144 +1,283 @@
-# -*- coding: utf-8 -*-
-"""
-AIAnnotator — единая точка для LLM-разметки.
-Толерантен к входу: можно передавать dict warning ИЛИ только набор **kwargs.
-Не падает на неожиданных полях, сам собирает контекст.
-"""
-
 from __future__ import annotations
-import json
-import typing as t
 
-from services.llm.yagpt_client import YandexGPTClient
+import json
+import logging
+import textwrap
+from typing import Any, Dict, Tuple
+
+from services.llm.clients.yandex_gpt import YandexGPTClient
 from services.analysis.heuristics import analyze_warning
 
-Json = dict[str, t.Any]
+log = logging.getLogger(__name__)
 
 
 class AIAnnotator:
+    """
+    Обёртка над YandexGPT для авторозметки одного срабатывания.
+
+    ВАЖНО: метод annotate_one возвращает словарь в "внутреннем" формате UI:
+
+        {
+            "status": "confirmed" | "false_positive",
+            "severity": "critical" | "medium" | "low" | "info",
+            "comment": "<объяснение на русском>",
+            "confidence": float (0..1),
+            "label": "<произвольная метка>"
+        }
+
+    Дальше этот словарь нормализуется в MainWindow._coerce_ai_result()
+    и применяется к объекту WarningDTO в _apply_ai_result().
+    """
+
     def __init__(self, client: YandexGPTClient) -> None:
         self.client = client
 
-    def annotate_one(self, warning: t.Optional[dict] = None, /, **kwargs) -> tuple[bool, Json, str]:
-        """
-        Универсальный вход:
-          - annotate_one(warning_dict)
-          - annotate_one(rule='X', file='...', line=123, ...)
-        Возвращает: (ok, ai_json, short_comment)
-        """
-        # Сливаем всё, что передали, в один словарь
-        data: dict[str, t.Any] = {}
-        if isinstance(warning, dict):
-            data.update(warning)
-        if kwargs:
-            data.update(kwargs)
+    # ----------------- Публичный метод -----------------
 
-        # Мягко достаём поля
-        file_path: str = str(data.get("file") or data.get("path") or "")
-        rule: str = str(data.get("rule") or data.get("rule_id") or data.get("name") or "")
-        level: str = str(data.get("level") or data.get("severity") or "")
-        message: str = str(data.get("message") or "")
-        code_snippet: str = str(data.get("snippet") or data.get("code") or "")
-        line: int = int(data.get("line") or data.get("line_number") or 0)
-        tags_str: str = str(data.get("tags") or data.get("tags_str") or "")
+    def annotate_one(
+        self,
+        rule: str,
+        level: str,
+        file_path: str,
+        line: int,
+        code: str,
+        text: str,
+        status: str,
+    ) -> Dict[str, Any]:
+        """
+        Авторозметка одного предупреждения статического анализа.
+        """
 
-        # Быстрые эвристики (подсказки для LLM)
-        heur = analyze_warning(
+        # Эвристический контекст (подсказки для модели)
+        ctx = analyze_warning(
+            rule_id=rule,
             file_path=file_path,
+            level=level,
+            code=code,
+            text=text,
+        )
+
+        prompt = self._build_prompt(
             rule=rule,
             level=level,
-            message=message,
-            code_snippet=code_snippet,
+            file_path=file_path,
             line=line,
-            tags_str=tags_str,
+            code=code,
+            text=text,
+            ctx=ctx,
         )
 
-        # Схема требуемого JSON от LLM
-        schema: Json = {
-            "type": "object",
-            "properties": {
-                "status": {"type": "string", "enum": ["confirmed", "false_positive"]},
-                "severity": {"type": "string", "enum": ["critical", "medium", "low", "info"]},
-                "label": {"type": "string"},
-                "confidence": {"type": "number"},
-                "comment": {"type": "string"},
-            },
-            "required": ["status", "severity", "label", "confidence", "comment"],
-            "additionalProperties": False,
+        raw_answer = self.client.generate(prompt)
+        status_ru, comment_ru = self._parse_answer(raw_answer, fallback_ctx=ctx)
+
+        # --- нормализация в формат UI ---
+
+        # внутренний статус в UI — "confirmed"/"false_positive"
+        normalized_status = (
+            "confirmed" if status_ru.lower().startswith("подтверж") else "false_positive"
+        )
+
+        # базовая серьёзность берём из эвристики (по сути — из исходного отчёта)
+        severity = getattr(ctx, "severity", None) or level or "info"
+        if severity not in {"critical", "medium", "low", "info"}:
+            severity = "info"
+
+        risk_hint = getattr(ctx, "risk_hint", "") or ""
+        # грубая оценка confidence по эвристике
+        base_conf = 0.7
+        if risk_hint == "likely_tp":
+            base_conf = 0.9
+        elif risk_hint == "likely_fp":
+            base_conf = 0.85
+
+        # label — просто аккуратная метка по типу/семейству правила + теги
+        label_parts = []
+        rule_family = getattr(ctx, "rule_family", "") or ""
+        if rule_family:
+            label_parts.append(rule_family)
+
+        tags = getattr(ctx, "tags", []) or []
+        label_parts.extend(tags)
+        label = ",".join(sorted(set(label_parts))) if label_parts else ""
+
+        return {
+            "status": normalized_status,
+            "severity": severity,
+            "comment": comment_ru,
+            "confidence": float(base_conf),
+            "label": label,
         }
 
-        system = (
-            "You are a senior static-analysis triager. "
-            "Decide if the finding is a real vulnerability. "
-            "Answer ONLY a JSON object that strictly matches the SCHEMA."
-        )
+    # ----------------- Внутренние методы -----------------
+
+    def _build_prompt(
+        self,
+        rule: str,
+        level: str,
+        file_path: str,
+        line: int,
+        code: str,
+        text: str,
+        ctx: Any,
+    ) -> str:
+        """
+        Собираем промпт для YandexGPT.
+
+        Здесь мы только подготавливаем все данные и явно просим
+        вернуть JSON с полями status / comment.
+        """
+
+        file_roles = []
+        if getattr(ctx, "is_test", False):
+            file_roles.append("тестовый файл")
+        if getattr(ctx, "is_doc", False) or getattr(ctx, "is_documentation", False):
+            file_roles.append("файл документации или примера")
+        if getattr(ctx, "is_locale", False):
+            file_roles.append("файл локализации/переводов")
+        if getattr(ctx, "is_migration", False):
+            file_roles.append("миграции или вспомогательные скрипты")
+
+        file_role_str = ", ".join(file_roles) if file_roles else "боевой код приложения"
+
+        rule_desc = getattr(ctx, "rule_description", "") or ""
+
+        # код подсказки риска от эвристики
+        risk_hint_code = getattr(ctx, "risk_hint", "") or ""
+        risk_hint_ru = getattr(ctx, "risk_hint_ru", "") or ""
+
+        # если заранее не подготовлен текст, аккуратно сформулируем его здесь
+        if not risk_hint_ru and risk_hint_code:
+            if risk_hint_code == "likely_tp":
+                risk_hint_ru = (
+                    "эвристика считает, что срабатывание ПОХОЖЕ на реальную уязвимость, "
+                    "но окончательное решение нужно принимать по коду и логике приложения"
+                )
+            elif risk_hint_code == "likely_fp":
+                risk_hint_ru = (
+                    "эвристика считает, что срабатывание ПОХОЖЕ на ложноположительное "
+                    "(тесты, документация, примеры и т.п.), "
+                    "но нужно проверить код перед окончательным решением"
+                )
+            elif risk_hint_code == "unclear":
+                risk_hint_ru = (
+                    "эвристика не даёт однозначной подсказки, решение нужно принимать "
+                    "исключительно по коду и контексту"
+                )
+
+        tags = getattr(ctx, "tags", []) or []
+        tags_str = ", ".join(tags)
+
+        # аккуратно оформляем фрагмент кода
+        code_block = (code or "").strip()
+        code_block = textwrap.dedent(code_block)
+        if not code_block:
+            code_block = "<фрагмент кода отсутствует>"
+        code_block = textwrap.indent(code_block, "    ")
+
+        text_block = (text or "").strip()
 
         prompt = f"""
-Rule: {rule}
-Severity (scanner): {level}
-File: {file_path}
-Line: {line}
-Tags: {tags_str}
-Message: {message}
+Ты — эксперт по информационной безопасности и статическому анализу исходного кода.
 
-Code snippet (focus on the highlighted line):
----
-{code_snippet}
----
+Тебе дано одно срабатывание статического анализатора (Svace / AppScreener).
+Нужно решить, является ли оно реальной уязвимостью или ложноположительным срабатыванием,
+и кратко объяснить своё решение. Отвечай ВСЕГДА на русском языке.
 
-Context notes (heuristics):
-- is_test_or_docs: {heur.get('is_test_or_docs')}
-- fake_or_placeholder_secret: {heur.get('fake_or_placeholder_secret')}
-- reason: {heur.get('reason')}
+Информация о срабатывании:
+- Правило: {rule}
+- Уровень (severity) из отчёта: {level}
+- Файл: {file_path}
+- Номер строки: {line}
+- Роль файла: {file_role_str}
+- Описание правила (если есть): {rule_desc}
+- Подсказка по риску (эвристика): {risk_hint_ru}
+- Эвристические теги: {tags_str}
 
-Task:
-1) If the code path is non-exploitable or belongs to tests/docs/examples, mark as false_positive with a short rationale tied to the snippet.
-2) Otherwise mark as confirmed and briefly state the concrete data flow (source→sink) or misuse that makes it exploitable.
-3) Confidence: 0.0–1.0
-""".strip()
+Текст сообщения статического анализатора:
+\"\"\"{text_block}\"\"\"
 
-        # Жёстко просим JSON
-        llm = self.client.generate_json(prompt, schema=schema, system=system)
+Код (фрагмент вокруг срабатывания):
+{code_block}
 
-        ai_json: Json = {
-            "status": "false_positive",
-            "severity": (level or "info").lower(),
-            "label": rule or "",
-            "confidence": 0.3,
-            "comment": "No structured result from LLM.",
-        }
+Проанализируй всё выше и реши:
+1) Есть ли здесь реальная уязвимость, которую нужно исправлять в продукте?
+2) Почему ты так считаешь (учитывай, является ли файл тестовым, документацией,
+   файлом локализации, примером из мануала и т.п.).
 
-        text = llm.get("text") or ""
-        ok = False
+Верни ответ СТРОГО в формате JSON одной строкой, без каких-либо пояснений до или после:
 
-        if "json" in llm and isinstance(llm["json"], dict):
-            ai_json = llm["json"]
-            ok = True
+{{"status": "Подтверждено" | "Отклонено",
+  "comment": "развёрнутый, но ёмкий комментарий на русском языке (2–5 предложений)"}}
+
+Где:
+- "Подтверждено" — действительно опасная уязвимость в коде приложения;
+- "Отклонено" — ложноположительное срабатывание (например, тест, пример, документация,
+  локаль, неиспользуемый код и т.п.).
+"""
+        return textwrap.dedent(prompt).strip()
+
+    def _parse_answer(self, raw: Any, fallback_ctx: Any) -> Tuple[str, str]:
+        """
+        Разбор ответа модели.
+
+        На выходе всегда:
+            ("Подтверждено" | "Отклонено", "комментарий")
+        """
+
+        # Клиент YandexGPT может вернуть как строку, так и словарь
+        # вида {"text": "...", "raw": {...}} (и иногда "json": {...}).
+        # Приводим всё к строке.
+        if isinstance(raw, dict):
+            raw_text = (
+                    raw.get("text")
+                    or raw.get("answer")
+                    or raw.get("output_text")
+                    or json.dumps(raw, ensure_ascii=False)
+            )
         else:
-            # Попытка вычленить объект JSON из текста
-            try:
-                start = text.find("{")
-                end = text.rfind("}")
-                if start != -1 and end != -1 and end > start:
-                    parsed = json.loads(text[start : end + 1])
-                    if isinstance(parsed, dict):
-                        ai_json = parsed
-                        ok = True
-            except Exception:
-                ok = False
+            raw_text = raw
 
-        # Нормализуем и страхуем обязательные поля
-        if not isinstance(ai_json, dict):
-            ai_json = {}
+        raw = (raw_text or "").strip()
+        default_status = (
+            "Подтверждено"
+            if getattr(fallback_ctx, "risk_hint", "") == "likely_tp"
+            else "Отклонено"
+        )
+        default_comment = (
+            "Модель вернула некорректный ответ, использован результат по эвристике."
+        )
 
-        ai_json.setdefault("status", "false_positive")
-        ai_json.setdefault("severity", (level or "info").lower())
-        ai_json.setdefault("label", rule or "")
-        ai_json.setdefault("confidence", 0.3)
-        ai_json.setdefault("comment", (text[:300] if text else "LLM returned empty text"))
+        if not raw:
+            return default_status, default_comment
 
-        short_comment = str(ai_json.get("comment") or "")
-        return bool(ok), ai_json, short_comment
+        # Пытаемся вытащить JSON из произвольного текста
+        try:
+            start = raw.index("{")
+            end = raw.rindex("}") + 1
+            json_part = raw[start:end]
+            data = json.loads(json_part)
+        except Exception as e:  # noqa: BLE001
+            log.warning("LLM ответ не похож на JSON: %r (%s)", raw, e)
+            return default_status, default_comment
 
-    def annotate_batch(self, warnings: list[dict]) -> list[tuple[bool, Json, str]]:
-        return [self.annotate_one(w) for w in warnings]
+        status_raw = str(data.get("status", "")).strip()
+        comment = str(data.get("comment", "")).strip()
+
+        if not comment:
+            comment = default_comment
+
+        status_low = status_raw.lower()
+
+        if status_low.startswith("подтверж"):
+            status_ru = "Подтверждено"
+        elif status_low.startswith(("откл", "false", "fp")):
+            status_ru = "Отклонено"
+        else:
+            # на всякий случай учитываем флаг is_security_issue, если модель его вернёт
+            is_issue = data.get("is_security_issue")
+            if isinstance(is_issue, bool):
+                status_ru = "Подтверждено" if is_issue else "Отклонено"
+            else:
+                status_ru = default_status
+
+        return status_ru, comment

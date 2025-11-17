@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QCheckBox, QPushButton, QFormLayout, QSizePolicy,
     QMessageBox, QDialog, QProgressDialog
 )
-
+from services.analysis.heuristics import analyze_warning
 from core.schema import WarningDTO, SEVERITY_COLORS
 from data.repositories.in_memory_repository import InMemoryRepository
 from services.code_provider import CodeProvider
@@ -111,14 +111,38 @@ class _AIWorker(QObject):
 
                 # вызов аннотатора — передаём параметры явно
                 try:
+                    # фрагмент вокруг срабатывания: сначала snippet из отчёта, при его отсутствии – пустая строка
+                    code_snippet = (
+                            getattr(w, "snippet_text", None)
+                            or getattr(w, "snippet", None)
+                            or ""
+                    )
+
+                    # номер строки: сначала start_line (новая схема), иначе line (старая), по умолчанию 0
+                    line_no = (
+                            getattr(w, "start_line", None)
+                            or getattr(w, "line", None)
+                            or 0
+                    )
+
+                    # путь к файлу: поддерживаем и file_path, и старое file
+                    file_path = (
+                            getattr(w, "file_path", None)
+                            or getattr(w, "file", "")
+                            or ""
+                    )
+
+                    # текст сообщения статического анализатора
+                    text_msg = getattr(w, "message", "") or ""
+
                     res = self.annotator.annotate_one(
-                        rule=getattr(w, "rule_id", "") or "",
-                        level=getattr(w, "severity_ui", "") or "info",
-                        file=getattr(w, "file", "") or "-",
-                        line=int(getattr(w, "start_line", None) or getattr(w, "line", 0) or 0),
-                        message=getattr(w, "message", "") or "",
-                        snippet=getattr(w, "snippet_text", None) or getattr(w, "snippet", None) or "",
-                        file_text=file_text,
+                        rule=w.rule_id or "",
+                        level=w.severity_ui or w.severity or "",
+                        file_path=file_path,
+                        line=int(line_no),
+                        code=code_snippet,
+                        text=text_msg,
+                        status=getattr(w, "status", "") or "",
                     )
                 except Exception as e:
                     self.error.emit(str(e))
